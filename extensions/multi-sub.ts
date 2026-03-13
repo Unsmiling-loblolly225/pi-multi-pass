@@ -4,19 +4,15 @@
  * Register additional OAuth subscription accounts for any supported provider.
  * Each extra account gets its own provider name, /login entry, and cloned models.
  *
- * Manage subscriptions via the /subs command (TUI) or MULTI_SUB env var.
+ * Features:
+ *   - /subs: manage subscriptions (add, remove, login, logout, status)
+ *   - /pool: define provider pools with auto-rotation on rate limit errors
+ *   - MULTI_SUB env var for scripting
  *
- * TUI commands:
- *   /subs          -- open subscription manager
- *   /subs list     -- list all extra subscriptions
- *   /subs add      -- add a new subscription
- *   /subs remove   -- remove a subscription
- *   /subs login    -- login to a subscription
- *   /subs logout   -- logout from a subscription
- *   /subs status   -- show auth status for all subscriptions
- *
- * Environment variable (alternative, merged with config file):
- *   MULTI_SUB=anthropic:2,openai-codex:1
+ * Pool auto-rotation: group subscriptions into pools. When the active sub
+ * hits a rate limit or error, automatically switch to the next available
+ * sub in the pool and retry. Keeps the same model ID, just rotates the
+ * provider/account.
  *
  * Config file: ~/.pi/agent/multi-pass.json
  *
@@ -30,32 +26,31 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	AgentEndEvent,
+} from "@mariozechner/pi-coding-agent";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import {
-	// Anthropic
 	anthropicOAuthProvider,
 	loginAnthropic,
 	refreshAnthropicToken,
-	// OpenAI Codex
 	openaiCodexOAuthProvider,
 	loginOpenAICodex,
 	refreshOpenAICodexToken,
-	// GitHub Copilot
 	githubCopilotOAuthProvider,
 	loginGitHubCopilot,
 	refreshGitHubCopilotToken,
 	getGitHubCopilotBaseUrl,
 	normalizeDomain,
-	// Google Gemini CLI
 	geminiCliOAuthProvider,
 	loginGeminiCli,
 	refreshGoogleCloudToken,
-	// Google Antigravity
 	antigravityOAuthProvider,
 	loginAntigravity,
 	refreshAntigravityToken,
-	// Types
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	type OAuthProviderInterface,
@@ -233,8 +228,21 @@ interface SubEntry {
 	label?: string;
 }
 
+interface PoolConfig {
+	/** Pool name (user-defined) */
+	name: string;
+	/** Base provider type, e.g. "openai-codex" */
+	baseProvider: string;
+	/** Provider names in rotation order. Includes the original (e.g. "openai-codex")
+	 *  and extras (e.g. "openai-codex-2", "openai-codex-3") */
+	members: string[];
+	/** Whether auto-rotation is enabled */
+	enabled: boolean;
+}
+
 interface MultiPassConfig {
 	subscriptions: SubEntry[];
+	pools: PoolConfig[];
 }
 
 function configPath(): string {
@@ -243,11 +251,15 @@ function configPath(): string {
 
 function loadConfig(): MultiPassConfig {
 	const path = configPath();
-	if (!existsSync(path)) return { subscriptions: [] };
+	if (!existsSync(path)) return { subscriptions: [], pools: [] };
 	try {
-		return JSON.parse(readFileSync(path, "utf-8")) as MultiPassConfig;
+		const raw = JSON.parse(readFileSync(path, "utf-8"));
+		return {
+			subscriptions: raw.subscriptions || [],
+			pools: raw.pools || [],
+		};
 	} catch {
-		return { subscriptions: [] };
+		return { subscriptions: [], pools: [] };
 	}
 }
 
@@ -259,7 +271,7 @@ function saveConfig(config: MultiPassConfig): void {
 }
 
 // ==========================================================================
-// Merge env var into config (env entries are additive, not persisted)
+// Merge env var into config
 // ==========================================================================
 
 function parseEnvConfig(): SubEntry[] {
@@ -272,7 +284,7 @@ function parseEnvConfig(): SubEntry[] {
 		const count = parseInt(countStr || "1", 10);
 		if (isNaN(count) || count < 1) continue;
 		for (let i = 0; i < count; i++) {
-			entries.push({ provider, index: 0 }); // index assigned during merge
+			entries.push({ provider, index: 0 });
 		}
 	}
 	return entries;
@@ -280,13 +292,10 @@ function parseEnvConfig(): SubEntry[] {
 
 function mergeConfigs(fileConfig: MultiPassConfig, envEntries: SubEntry[]): SubEntry[] {
 	const merged = [...fileConfig.subscriptions];
-
-	// For each env entry, check if we already have enough for that provider
 	for (const envEntry of envEntries) {
 		const existingCount = merged.filter((s) => s.provider === envEntry.provider).length;
 		const envCountForProvider = envEntries.filter((e) => e.provider === envEntry.provider).length;
 		if (existingCount < envCountForProvider) {
-			// Need to add more -- find next available index
 			const usedIndices = merged
 				.filter((s) => s.provider === envEntry.provider)
 				.map((s) => s.index);
@@ -295,11 +304,9 @@ function mergeConfigs(fileConfig: MultiPassConfig, envEntries: SubEntry[]): SubE
 			merged.push({ provider: envEntry.provider, index: nextIndex });
 		}
 	}
-
 	return merged;
 }
 
-// Assign indices to entries that don't have one yet
 function normalizeEntries(entries: SubEntry[]): SubEntry[] {
 	const byProvider = new Map<string, SubEntry[]>();
 	for (const entry of entries) {
@@ -307,9 +314,8 @@ function normalizeEntries(entries: SubEntry[]): SubEntry[] {
 		list.push(entry);
 		byProvider.set(entry.provider, list);
 	}
-
 	const result: SubEntry[] = [];
-	for (const [provider, list] of byProvider) {
+	for (const [, list] of byProvider) {
 		const usedIndices = new Set(list.filter((e) => e.index > 0).map((e) => e.index));
 		let nextIndex = 2;
 		for (const entry of list) {
@@ -330,14 +336,24 @@ function normalizeEntries(entries: SubEntry[]): SubEntry[] {
 // Provider name helpers
 // ==========================================================================
 
-function providerName(entry: SubEntry): string {
+function subProviderName(entry: SubEntry): string {
 	return `${entry.provider}-${entry.index}`;
 }
 
-function displayName(entry: SubEntry): string {
+function subDisplayName(entry: SubEntry): string {
 	const template = PROVIDER_TEMPLATES[entry.provider];
 	const label = entry.label ? ` (${entry.label})` : "";
 	return `${template?.displayName || entry.provider} #${entry.index}${label}`;
+}
+
+/** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex" */
+function getBaseProvider(providerName: string): string | undefined {
+	// Direct match
+	if (PROVIDER_TEMPLATES[providerName]) return providerName;
+	// Strip trailing -N
+	const match = providerName.match(/^(.+)-(\d+)$/);
+	if (match && PROVIDER_TEMPLATES[match[1]]) return match[1];
+	return undefined;
 }
 
 // ==========================================================================
@@ -368,7 +384,7 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const template = PROVIDER_TEMPLATES[entry.provider];
 	if (!template) return;
 
-	const name = providerName(entry);
+	const name = subProviderName(entry);
 	const oauth = template.buildOAuth(entry.index);
 	const modifyModels = template.buildModifyModels?.(name);
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
@@ -384,11 +400,218 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 }
 
 // ==========================================================================
-// TUI command handlers
+// Pool rotation engine
 // ==========================================================================
 
-async function handleList(ctx: ExtensionCommandContext): Promise<void> {
-	const config = loadConfig();
+const RATE_LIMIT_PATTERNS = [
+	/usage.?limit/i,
+	/rate.?limit/i,
+	/limit.*reached/i,
+	/too many requests/i,
+	/overloaded/i,
+	/capacity/i,
+	/429/,
+	/quota/i,
+];
+
+function isRateLimitError(errorMessage: string): boolean {
+	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
+}
+
+interface PoolState {
+	/** Current index into pool.members */
+	currentIndex: number;
+	/** Members that are temporarily "exhausted" (hit limit), with timestamps */
+	exhausted: Map<string, number>;
+	/** Cooldown period in ms before retrying an exhausted member */
+	cooldownMs: number;
+}
+
+class PoolManager {
+	private pools: Map<string, PoolConfig> = new Map();
+	private poolStates: Map<string, PoolState> = new Map();
+	/** Map from provider name -> pool name (for quick lookup) */
+	private providerToPool: Map<string, string> = new Map();
+	private pi: ExtensionAPI;
+	private lastRetryPrompt: string | null = null;
+	private retryInProgress = false;
+
+	constructor(pi: ExtensionAPI) {
+		this.pi = pi;
+	}
+
+	loadPools(configs: PoolConfig[]): void {
+		this.pools.clear();
+		this.providerToPool.clear();
+
+		for (const pool of configs) {
+			if (!pool.enabled) continue;
+			this.pools.set(pool.name, pool);
+
+			// Initialize state if not exists
+			if (!this.poolStates.has(pool.name)) {
+				this.poolStates.set(pool.name, {
+					currentIndex: 0,
+					exhausted: new Map(),
+					cooldownMs: 5 * 60 * 1000, // 5 min default cooldown
+				});
+			}
+
+			// Map each member to this pool
+			for (const member of pool.members) {
+				this.providerToPool.set(member, pool.name);
+			}
+		}
+	}
+
+	/** Find pool for a given provider name */
+	getPoolForProvider(providerName: string): PoolConfig | undefined {
+		const poolName = this.providerToPool.get(providerName);
+		return poolName ? this.pools.get(poolName) : undefined;
+	}
+
+	/** Get available (non-exhausted, authenticated) members of a pool */
+	getAvailableMembers(
+		pool: PoolConfig,
+		authStorage: { hasAuth(provider: string): boolean },
+	): string[] {
+		const state = this.poolStates.get(pool.name);
+		if (!state) return pool.members;
+
+		const now = Date.now();
+		return pool.members.filter((member) => {
+			// Must have auth
+			if (!authStorage.hasAuth(member)) return false;
+			// Check if exhausted and still in cooldown
+			const exhaustedAt = state.exhausted.get(member);
+			if (exhaustedAt && now - exhaustedAt < state.cooldownMs) return false;
+			// Clear expired exhaustion
+			if (exhaustedAt && now - exhaustedAt >= state.cooldownMs) {
+				state.exhausted.delete(member);
+			}
+			return true;
+		});
+	}
+
+	/** Mark a member as exhausted (hit rate limit) */
+	markExhausted(providerName: string): void {
+		const poolName = this.providerToPool.get(providerName);
+		if (!poolName) return;
+		const state = this.poolStates.get(poolName);
+		if (!state) return;
+		state.exhausted.set(providerName, Date.now());
+	}
+
+	/** Get the next available member in a pool, skipping the current one */
+	getNextMember(
+		pool: PoolConfig,
+		currentProvider: string,
+		authStorage: { hasAuth(provider: string): boolean },
+	): string | undefined {
+		const available = this.getAvailableMembers(pool, authStorage);
+		// Filter out current provider
+		const candidates = available.filter((m) => m !== currentProvider);
+		if (candidates.length === 0) return undefined;
+
+		const state = this.poolStates.get(pool.name);
+		if (!state) return candidates[0];
+
+		// Round-robin: advance index
+		state.currentIndex = (state.currentIndex + 1) % candidates.length;
+		return candidates[state.currentIndex];
+	}
+
+	/**
+	 * Handle an error: if it's a rate limit and the provider is in a pool,
+	 * rotate to the next member and retry.
+	 * Returns true if rotation happened.
+	 */
+	async handleError(
+		errorMessage: string,
+		currentModel: Model<Api> | undefined,
+		ctx: ExtensionContext,
+		lastUserPrompt: string | null,
+	): Promise<boolean> {
+		if (!currentModel) return false;
+		if (!isRateLimitError(errorMessage)) return false;
+		if (this.retryInProgress) return false;
+
+		const pool = this.getPoolForProvider(currentModel.provider);
+		if (!pool) return false;
+
+		// Mark current as exhausted
+		this.markExhausted(currentModel.provider);
+
+		// Find next member
+		const nextProvider = this.getNextMember(
+			pool,
+			currentModel.provider,
+			ctx.modelRegistry.authStorage,
+		);
+
+		if (!nextProvider) {
+			ctx.ui.notify(
+				`[pool:${pool.name}] All members exhausted. Waiting for cooldown.`,
+				"warning",
+			);
+			return false;
+		}
+
+		// Find the same model ID on the next provider
+		const nextModel = ctx.modelRegistry.find(nextProvider, currentModel.id);
+		if (!nextModel) {
+			ctx.ui.notify(
+				`[pool:${pool.name}] Model ${currentModel.id} not found on ${nextProvider}`,
+				"warning",
+			);
+			return false;
+		}
+
+		// Switch model
+		const success = await this.pi.setModel(nextModel);
+		if (!success) {
+			ctx.ui.notify(
+				`[pool:${pool.name}] Failed to switch to ${nextProvider} (no auth)`,
+				"warning",
+			);
+			return false;
+		}
+
+		const fromLabel = currentModel.provider;
+		const toLabel = nextProvider;
+		ctx.ui.notify(
+			`[pool:${pool.name}] Rate limited on ${fromLabel}, rotating to ${toLabel}`,
+			"info",
+		);
+		ctx.ui.setStatus("multi-pass", `pool:${pool.name} -> ${toLabel}`);
+
+		// Retry the last prompt
+		if (lastUserPrompt) {
+			this.retryInProgress = true;
+			this.pi.sendUserMessage(lastUserPrompt);
+		}
+
+		return true;
+	}
+
+	clearRetryFlag(): void {
+		this.retryInProgress = false;
+	}
+
+	getPoolConfigs(): PoolConfig[] {
+		return Array.from(this.pools.values());
+	}
+
+	getAllPoolConfigs(config: MultiPassConfig): PoolConfig[] {
+		return config.pools || [];
+	}
+}
+
+// ==========================================================================
+// /subs command handlers
+// ==========================================================================
+
+async function handleSubsList(ctx: ExtensionCommandContext, config: MultiPassConfig): Promise<void> {
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
@@ -398,7 +621,7 @@ async function handleList(ctx: ExtensionCommandContext): Promise<void> {
 	}
 
 	const lines = all.map((entry) => {
-		const name = providerName(entry);
+		const name = subProviderName(entry);
 		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
 		const status = hasAuth ? "[logged in]" : "[not logged in]";
 		const source = config.subscriptions.find(
@@ -406,13 +629,13 @@ async function handleList(ctx: ExtensionCommandContext): Promise<void> {
 		)
 			? "config"
 			: "env";
-		return `${displayName(entry)} -- ${status} (${source})`;
+		return `${subDisplayName(entry)} -- ${status} (${source})`;
 	});
 
 	await ctx.ui.select("Extra Subscriptions", lines);
 }
 
-async function handleAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	const providerLabels = SUPPORTED_PROVIDERS.map((p) => {
 		const t = PROVIDER_TEMPLATES[p];
 		return `${p} -- ${t.displayName}`;
@@ -430,15 +653,11 @@ async function handleAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promis
 	const label = await ctx.ui.input("Label (optional)", "e.g. work, personal");
 
 	const config = loadConfig();
-	const usedIndices = new Set(
-		config.subscriptions.filter((s) => s.provider === provider).map((s) => s.index),
-	);
-	// Also account for env-based entries
 	const envEntries = parseEnvConfig();
 	const allEntries = normalizeEntries(mergeConfigs(config, envEntries));
-	for (const e of allEntries) {
-		if (e.provider === provider) usedIndices.add(e.index);
-	}
+	const usedIndices = new Set(
+		allEntries.filter((e) => e.provider === provider).map((e) => e.index),
+	);
 	let nextIndex = 2;
 	while (usedIndices.has(nextIndex)) nextIndex++;
 
@@ -451,34 +670,36 @@ async function handleAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promis
 	config.subscriptions.push(entry);
 	saveConfig(config);
 
-	// Register immediately
 	registerSub(pi, entry);
 	ctx.modelRegistry.refresh();
 
 	const loginNow = await ctx.ui.confirm(
-		displayName(entry),
-		`Created ${displayName(entry)}.\n\nLogin now?`,
+		subDisplayName(entry),
+		`Created ${subDisplayName(entry)}.\n\nLogin now?`,
 	);
 
 	if (loginNow) {
-		await triggerLogin(ctx, entry);
+		ctx.ui.notify(
+			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			"info",
+		);
 	} else {
-		ctx.ui.notify(`Added ${displayName(entry)}. Use /subs login to authenticate.`, "info");
+		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
 	}
 }
 
-async function handleRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadConfig();
 	if (config.subscriptions.length === 0) {
-		ctx.ui.notify("No saved subscriptions to remove. (Env-based ones can't be removed here.)", "info");
+		ctx.ui.notify("No saved subscriptions to remove.", "info");
 		return;
 	}
 
 	const options = config.subscriptions.map((entry) => {
-		const name = providerName(entry);
+		const name = subProviderName(entry);
 		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
 		const status = hasAuth ? " [logged in]" : "";
-		return `${displayName(entry)}${status}`;
+		return `${subDisplayName(entry)}${status}`;
 	});
 
 	const selected = await ctx.ui.select("Remove subscription", options);
@@ -490,78 +711,69 @@ async function handleRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pro
 	const entry = config.subscriptions[idx];
 	const confirmed = await ctx.ui.confirm(
 		"Confirm removal",
-		`Remove ${displayName(entry)}?\nThis will also logout if authenticated.`,
+		`Remove ${subDisplayName(entry)}?\nThis will also logout if authenticated.`,
 	);
 	if (!confirmed) return;
 
-	// Logout if authenticated
-	const name = providerName(entry);
+	const name = subProviderName(entry);
 	if (ctx.modelRegistry.authStorage.hasAuth(name)) {
 		ctx.modelRegistry.authStorage.logout(name);
 	}
-
-	// Unregister provider
 	pi.unregisterProvider(name);
 
-	// Remove from config
+	// Also remove from any pools
+	for (const pool of config.pools) {
+		pool.members = pool.members.filter((m) => m !== name);
+	}
+	// Remove empty pools
+	config.pools = config.pools.filter((p) => p.members.length > 0);
+
 	config.subscriptions.splice(idx, 1);
 	saveConfig(config);
-
 	ctx.modelRegistry.refresh();
-	ctx.ui.notify(`Removed ${displayName(entry)}`, "info");
+	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
 }
 
-async function triggerLogin(ctx: ExtensionCommandContext, entry: SubEntry): Promise<void> {
-	const name = providerName(entry);
-	try {
-		// Use the built-in /login flow by telling the user which provider to pick
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
-	} catch (error: unknown) {
-		ctx.ui.notify(
-			`Login hint failed: ${error instanceof Error ? error.message : String(error)}`,
-			"error",
-		);
-	}
-}
-
-async function handleLogin(ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const notLoggedIn = all.filter(
-		(entry) => !ctx.modelRegistry.authStorage.hasAuth(providerName(entry)),
+		(entry) => !ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
 	);
 
 	if (notLoggedIn.length === 0) {
-		if (all.length === 0) {
-			ctx.ui.notify("No subscriptions configured. Use /subs add first.", "info");
-		} else {
-			ctx.ui.notify("All subscriptions are already logged in.", "info");
-		}
+		ctx.ui.notify(
+			all.length === 0
+				? "No subscriptions configured. Use /subs add first."
+				: "All subscriptions are already logged in.",
+			"info",
+		);
 		return;
 	}
 
-	const options = notLoggedIn.map((entry) => displayName(entry));
+	const options = notLoggedIn.map((e) => subDisplayName(e));
 	const selected = await ctx.ui.select("Login to subscription", options);
 	if (!selected) return;
 
 	const idx = options.indexOf(selected);
 	if (idx < 0) return;
 
-	await triggerLogin(ctx, notLoggedIn[idx]);
+	const entry = notLoggedIn[idx];
+	ctx.ui.notify(
+		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+		"info",
+	);
 }
 
-async function handleLogout(ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const loggedIn = all.filter((entry) =>
-		ctx.modelRegistry.authStorage.hasAuth(providerName(entry)),
+		ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
 	);
 
 	if (loggedIn.length === 0) {
@@ -569,7 +781,7 @@ async function handleLogout(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 
-	const options = loggedIn.map((entry) => displayName(entry));
+	const options = loggedIn.map((e) => subDisplayName(e));
 	const selected = await ctx.ui.select("Logout from subscription", options);
 	if (!selected) return;
 
@@ -577,13 +789,12 @@ async function handleLogout(ctx: ExtensionCommandContext): Promise<void> {
 	if (idx < 0) return;
 
 	const entry = loggedIn[idx];
-	const name = providerName(entry);
-	ctx.modelRegistry.authStorage.logout(name);
+	ctx.modelRegistry.authStorage.logout(subProviderName(entry));
 	ctx.modelRegistry.refresh();
-	ctx.ui.notify(`Logged out of ${displayName(entry)}`, "info");
+	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
 
-async function handleStatus(ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
@@ -595,7 +806,7 @@ async function handleStatus(ctx: ExtensionCommandContext): Promise<void> {
 
 	const lines: string[] = [];
 	for (const entry of all) {
-		const name = providerName(entry);
+		const name = subProviderName(entry);
 		const cred = ctx.modelRegistry.authStorage.get(name);
 		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
 
@@ -606,7 +817,7 @@ async function handleStatus(ctx: ExtensionCommandContext): Promise<void> {
 			const expiresIn = cred.expires - Date.now();
 			if (expiresIn > 0) {
 				const mins = Math.round(expiresIn / 60000);
-				status = `logged in (token expires in ${mins}m)`;
+				status = `logged in (expires ${mins}m)`;
 			} else {
 				status = "logged in (token expired, will refresh)";
 			}
@@ -621,13 +832,307 @@ async function handleStatus(ctx: ExtensionCommandContext): Promise<void> {
 			? "saved"
 			: "env";
 
-		lines.push(`${displayName(entry)} | ${status} | ${modelCount} models | ${source}`);
+		// Check if in any pool
+		const inPools = config.pools
+			.filter((p) => p.members.includes(name))
+			.map((p) => p.name);
+		const poolInfo = inPools.length > 0 ? ` | pools: ${inPools.join(", ")}` : "";
+
+		lines.push(
+			`${subDisplayName(entry)} | ${status} | ${modelCount} models | ${source}${poolInfo}`,
+		);
 	}
 
 	await ctx.ui.select("Subscription Status", lines);
 }
 
-async function handleMainMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+// ==========================================================================
+// /pool command handlers
+// ==========================================================================
+
+/** Get all provider names that belong to a base provider type (including the original) */
+function getAllProvidersForBase(
+	baseProvider: string,
+	allSubs: SubEntry[],
+): string[] {
+	const providers = [baseProvider]; // original
+	for (const entry of allSubs) {
+		if (entry.provider === baseProvider) {
+			providers.push(subProviderName(entry));
+		}
+	}
+	return providers;
+}
+
+async function handlePoolCreate(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	// Pick base provider
+	const providerLabels = SUPPORTED_PROVIDERS.map((p) => {
+		const t = PROVIDER_TEMPLATES[p];
+		return `${p} -- ${t.displayName}`;
+	});
+
+	const selectedProvider = await ctx.ui.select("Pool base provider", providerLabels);
+	if (!selectedProvider) return;
+	const baseProvider = selectedProvider.split(" -- ")[0];
+
+	// Pool name
+	const poolName = await ctx.ui.input("Pool name", `e.g. ${baseProvider}-pool`);
+	if (!poolName?.trim()) return;
+
+	const config = loadConfig();
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+
+	// Get all providers for this base type
+	const allProviders = getAllProvidersForBase(baseProvider, allSubs);
+
+	// Filter to only authenticated ones
+	const authedProviders = allProviders.filter((p) =>
+		ctx.modelRegistry.authStorage.hasAuth(p),
+	);
+	const unauthedProviders = allProviders.filter(
+		(p) => !ctx.modelRegistry.authStorage.hasAuth(p),
+	);
+
+	if (authedProviders.length === 0) {
+		ctx.ui.notify(
+			`No authenticated ${baseProvider} subscriptions found. Login first with /subs login.`,
+			"warning",
+		);
+		return;
+	}
+
+	// Let user pick which to include
+	const memberLabels = allProviders.map((p) => {
+		const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+		return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
+	});
+
+	// Use multiple selects (select each to toggle, done when they cancel)
+	const members: string[] = [];
+	let selecting = true;
+	while (selecting) {
+		const remaining = allProviders.filter((p) => !members.includes(p));
+		if (remaining.length === 0) break;
+
+		const options = [
+			`--- Selected (${members.length}): ${members.join(", ") || "none"} ---`,
+			...remaining.map((p) => {
+				const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+				return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
+			}),
+			"[Done - create pool]",
+		];
+
+		const picked = await ctx.ui.select("Add members (Esc when done)", options);
+		if (!picked || picked.startsWith("---")) {
+			if (members.length > 0) selecting = false;
+			else {
+				ctx.ui.notify("Select at least one member.", "warning");
+			}
+			continue;
+		}
+		if (picked === "[Done - create pool]") {
+			selecting = false;
+			continue;
+		}
+
+		const provName = picked.split(" ")[0];
+		if (provName && allProviders.includes(provName)) {
+			members.push(provName);
+		}
+	}
+
+	if (members.length < 2) {
+		ctx.ui.notify("Pool needs at least 2 members for rotation to be useful.", "warning");
+		return;
+	}
+
+	const pool: PoolConfig = {
+		name: poolName.trim(),
+		baseProvider,
+		members,
+		enabled: true,
+	};
+
+	// Check for duplicate name
+	const existingIdx = config.pools.findIndex((p) => p.name === pool.name);
+	if (existingIdx >= 0) {
+		const overwrite = await ctx.ui.confirm(
+			"Pool exists",
+			`Pool "${pool.name}" already exists. Overwrite?`,
+		);
+		if (!overwrite) return;
+		config.pools[existingIdx] = pool;
+	} else {
+		config.pools.push(pool);
+	}
+
+	saveConfig(config);
+	poolManager.loadPools(config.pools);
+
+	ctx.ui.notify(
+		`Created pool "${pool.name}" with ${members.length} members: ${members.join(", ")}`,
+		"info",
+	);
+}
+
+async function handlePoolList(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const config = loadConfig();
+	const pools = config.pools;
+
+	if (pools.length === 0) {
+		ctx.ui.notify("No pools configured. Use /pool create to make one.", "info");
+		return;
+	}
+
+	const lines = pools.map((pool) => {
+		const status = pool.enabled ? "enabled" : "disabled";
+		const authedCount = pool.members.filter((m) =>
+			ctx.modelRegistry.authStorage.hasAuth(m),
+		).length;
+		return `${pool.name} | ${pool.baseProvider} | ${pool.members.length} members (${authedCount} authed) | ${status}`;
+	});
+
+	await ctx.ui.select("Pools", lines);
+}
+
+async function handlePoolToggle(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const config = loadConfig();
+	if (config.pools.length === 0) {
+		ctx.ui.notify("No pools configured.", "info");
+		return;
+	}
+
+	const options = config.pools.map(
+		(p) => `${p.name} -- currently ${p.enabled ? "enabled" : "disabled"}`,
+	);
+
+	const selected = await ctx.ui.select("Toggle pool", options);
+	if (!selected) return;
+
+	const idx = options.indexOf(selected);
+	if (idx < 0) return;
+
+	config.pools[idx].enabled = !config.pools[idx].enabled;
+	saveConfig(config);
+	poolManager.loadPools(config.pools);
+
+	const pool = config.pools[idx];
+	ctx.ui.notify(
+		`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`,
+		"info",
+	);
+}
+
+async function handlePoolRemove(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const config = loadConfig();
+	if (config.pools.length === 0) {
+		ctx.ui.notify("No pools configured.", "info");
+		return;
+	}
+
+	const options = config.pools.map(
+		(p) => `${p.name} (${p.members.length} members)`,
+	);
+
+	const selected = await ctx.ui.select("Remove pool", options);
+	if (!selected) return;
+
+	const idx = options.indexOf(selected);
+	if (idx < 0) return;
+
+	const pool = config.pools[idx];
+	const confirmed = await ctx.ui.confirm(
+		"Confirm removal",
+		`Remove pool "${pool.name}"? (Subscriptions are kept.)`,
+	);
+	if (!confirmed) return;
+
+	config.pools.splice(idx, 1);
+	saveConfig(config);
+	poolManager.loadPools(config.pools);
+	ctx.ui.notify(`Removed pool "${pool.name}"`, "info");
+}
+
+async function handlePoolStatus(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const config = loadConfig();
+	if (config.pools.length === 0) {
+		ctx.ui.notify("No pools configured.", "info");
+		return;
+	}
+
+	const lines: string[] = [];
+	for (const pool of config.pools) {
+		lines.push(`=== ${pool.name} (${pool.enabled ? "enabled" : "disabled"}) ===`);
+		for (const member of pool.members) {
+			const authed = ctx.modelRegistry.authStorage.hasAuth(member);
+			const available = poolManager
+				.getAvailableMembers(pool, ctx.modelRegistry.authStorage)
+				.includes(member);
+			let status = authed ? "logged in" : "not logged in";
+			if (authed && !available) status += " (rate limited, cooling down)";
+			lines.push(`  ${member} -- ${status}`);
+		}
+	}
+
+	await ctx.ui.select("Pool Status", lines);
+}
+
+async function handlePoolMenu(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const actions = [
+		"create   -- Create a new rotation pool",
+		"list     -- Show all pools",
+		"toggle   -- Enable/disable a pool",
+		"remove   -- Remove a pool",
+		"status   -- Detailed pool status with member health",
+	];
+
+	const selected = await ctx.ui.select("Pool Manager", actions);
+	if (!selected) return;
+
+	const action = selected.split(" ")[0].trim();
+	switch (action) {
+		case "create":
+			return handlePoolCreate(ctx, poolManager);
+		case "list":
+			return handlePoolList(ctx, poolManager);
+		case "toggle":
+			return handlePoolToggle(ctx, poolManager);
+		case "remove":
+			return handlePoolRemove(ctx, poolManager);
+		case "status":
+			return handlePoolStatus(ctx, poolManager);
+	}
+}
+
+// ==========================================================================
+// /subs main menu (updated)
+// ==========================================================================
+
+async function handleSubsMenu(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
 	const actions = [
 		"list     -- Show all extra subscriptions",
 		"add      -- Add a new subscription",
@@ -641,19 +1146,20 @@ async function handleMainMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
 	if (!selected) return;
 
 	const action = selected.split(" ")[0].trim();
+	const config = loadConfig();
 	switch (action) {
 		case "list":
-			return handleList(ctx);
+			return handleSubsList(ctx, config);
 		case "add":
-			return handleAdd(pi, ctx);
+			return handleSubsAdd(pi, ctx);
 		case "remove":
-			return handleRemove(pi, ctx);
+			return handleSubsRemove(pi, ctx);
 		case "login":
-			return handleLogin(ctx);
+			return handleSubsLogin(ctx);
 		case "logout":
-			return handleLogout(ctx);
+			return handleSubsLogout(ctx);
 		case "status":
-			return handleStatus(ctx);
+			return handleSubsStatus(ctx);
 	}
 }
 
@@ -662,14 +1168,65 @@ async function handleMainMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
 // ==========================================================================
 
 export default function multiSub(pi: ExtensionAPI) {
-	// Load and register all configured subscriptions at startup
 	const config = loadConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
+	// Register all subscriptions
 	for (const entry of all) {
 		registerSub(pi, entry);
 	}
+
+	// Initialize pool manager
+	const poolManager = new PoolManager(pi);
+	poolManager.loadPools(config.pools);
+
+	// Track last user prompt for retry on rotation
+	let lastUserPrompt: string | null = null;
+
+	// Listen for user input to track last prompt
+	pi.on("before_agent_start", async (event) => {
+		lastUserPrompt = event.prompt;
+		poolManager.clearRetryFlag();
+	});
+
+	// Listen for errors to trigger pool rotation
+	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
+		if (!event.messages || event.messages.length === 0) return;
+
+		const lastMsg = event.messages[event.messages.length - 1];
+		if (!lastMsg || lastMsg.role !== "assistant") return;
+
+		const assistantMsg = lastMsg as any;
+		if (assistantMsg.stopReason !== "error") return;
+		if (!assistantMsg.errorMessage) return;
+
+		const rotated = await poolManager.handleError(
+			assistantMsg.errorMessage,
+			ctx.model,
+			ctx,
+			lastUserPrompt,
+		);
+
+		if (!rotated && isRateLimitError(assistantMsg.errorMessage)) {
+			// Show which pool members are available
+			const pool = ctx.model
+				? poolManager.getPoolForProvider(ctx.model.provider)
+				: undefined;
+			if (pool) {
+				const available = poolManager.getAvailableMembers(
+					pool,
+					ctx.modelRegistry.authStorage,
+				);
+				if (available.length === 0) {
+					ctx.ui.notify(
+						`[pool:${pool.name}] All members rate limited. Try again in a few minutes.`,
+						"warning",
+					);
+				}
+			}
+		}
+	});
 
 	// Register /subs command
 	pi.registerCommand("subs", {
@@ -682,27 +1239,62 @@ export default function multiSub(pi: ExtensionAPI) {
 				: null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const config = loadConfig();
 			const subcommand = args.trim().toLowerCase();
 			switch (subcommand) {
 				case "list":
 				case "ls":
-					return handleList(ctx);
+					return handleSubsList(ctx, config);
 				case "add":
 				case "new":
-					return handleAdd(pi, ctx);
+					return handleSubsAdd(pi, ctx);
 				case "remove":
 				case "rm":
 				case "delete":
-					return handleRemove(pi, ctx);
+					return handleSubsRemove(pi, ctx);
 				case "login":
-					return handleLogin(ctx);
+					return handleSubsLogin(ctx);
 				case "logout":
-					return handleLogout(ctx);
+					return handleSubsLogout(ctx);
 				case "status":
 				case "info":
-					return handleStatus(ctx);
+					return handleSubsStatus(ctx);
 				default:
-					return handleMainMenu(pi, ctx);
+					return handleSubsMenu(pi, ctx, poolManager);
+			}
+		},
+	});
+
+	// Register /pool command
+	pi.registerCommand("pool", {
+		description: "Manage subscription rotation pools",
+		getArgumentCompletions: (prefix: string) => {
+			const subcommands = ["create", "list", "toggle", "remove", "status"];
+			const filtered = subcommands.filter((s) => s.startsWith(prefix));
+			return filtered.length > 0
+				? filtered.map((s) => ({ value: s, label: s }))
+				: null;
+		},
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const subcommand = args.trim().toLowerCase();
+			switch (subcommand) {
+				case "create":
+				case "new":
+					return handlePoolCreate(ctx, poolManager);
+				case "list":
+				case "ls":
+					return handlePoolList(ctx, poolManager);
+				case "toggle":
+					return handlePoolToggle(ctx, poolManager);
+				case "remove":
+				case "rm":
+				case "delete":
+					return handlePoolRemove(ctx, poolManager);
+				case "status":
+				case "info":
+					return handlePoolStatus(ctx, poolManager);
+				default:
+					return handlePoolMenu(ctx, poolManager);
 			}
 		},
 	});

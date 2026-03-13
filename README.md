@@ -1,68 +1,107 @@
-# multi-pass
+# pi-multi-pass
 
-Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- use multiple OAuth accounts per provider.
-
-If you have multiple ChatGPT, Claude, Copilot, or other subscription accounts, this extension lets you log in to all of them and switch between accounts via `/model`.
+Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- use multiple OAuth accounts per provider with automatic rate-limit rotation.
 
 ## Install
+
+```bash
+pi install npm:pi-multi-pass
+```
+
+Or via git:
 
 ```bash
 pi install git:github.com/hjanuschka/pi-multi-pass
 ```
 
-## Usage
+## Features
 
-### TUI command: `/subs`
+- **Multiple subscriptions**: Add extra OAuth accounts for any provider
+- **Rotation pools**: Group subscriptions and auto-rotate on rate limits
+- **TUI management**: `/subs` and `/pool` commands -- no config files needed
+- **Labels**: Tag subscriptions (e.g. "work", "personal")
+- **Status tracking**: Token expiry, pool health, auth state
 
-Manage subscriptions interactively -- no env vars or config files needed.
+## Quick start
 
 ```
-/subs          Open the subscription manager menu
-/subs add      Add a new subscription (pick provider, optional label)
-/subs remove   Remove a subscription and logout
-/subs login    Login to a subscription (directs to /login)
-/subs logout   Logout from a subscription
-/subs list     List all extra subscriptions with auth status
-/subs status   Show detailed status (token expiry, model count, source)
+/subs add              Pick a provider, add a subscription
+/login                 Authenticate the new subscription
+/pool create           Group subs into a rotation pool
 ```
 
-#### Adding a subscription
+That's it. When one account hits a rate limit, multi-pass automatically switches to the next and retries.
 
-1. `/subs add`
-2. Pick a provider (e.g., `openai-codex`)
-3. Optionally add a label (e.g., "work", "personal")
-4. Choose to login now or later
-5. Complete the OAuth flow via `/login`
-6. Models appear in `/model` as "GPT-5.2 (#2)", "Claude Sonnet 4.5 (#2)", etc.
+## Commands
 
-### Environment variable (alternative)
+### `/subs` -- Subscription management
 
-For scripting or CI, set `MULTI_SUB`:
+```
+/subs              Open menu
+/subs add          Add a new subscription
+/subs remove       Remove a subscription
+/subs login        Login to a subscription
+/subs logout       Logout from a subscription
+/subs list         List all subscriptions with auth status
+/subs status       Detailed status (token expiry, pool membership)
+```
+
+### `/pool` -- Rotation pool management
+
+```
+/pool              Open menu
+/pool create       Create a pool (pick provider, select members)
+/pool list         Show all pools
+/pool toggle       Enable/disable a pool
+/pool remove       Delete a pool (keeps subscriptions)
+/pool status       Member health (logged in, rate limited, cooling down)
+```
+
+## How pools work
+
+A pool groups multiple subscriptions of the same provider type for automatic failover:
+
+1. You're using `openai-codex` and hit a rate limit
+2. Multi-pass detects the error, marks `openai-codex` as exhausted
+3. Switches to `openai-codex-2` (same model ID, different account)
+4. Retries your last prompt automatically
+5. After a 5-minute cooldown, `openai-codex` becomes available again
+
+```
+/subs add          -> openai-codex-2
+/subs add          -> openai-codex-3
+/pool create       -> "codex-pool" with [openai-codex, openai-codex-2, openai-codex-3]
+```
+
+Pool status shows real-time health:
+
+```
+/pool status
+=== codex-pool (enabled) ===
+  openai-codex   -- logged in
+  openai-codex-2 -- logged in (rate limited, cooling down)
+  openai-codex-3 -- logged in
+```
+
+## Supported providers
+
+| Provider key | Service |
+|---|---|
+| `anthropic` | Claude Pro/Max |
+| `openai-codex` | ChatGPT Plus/Pro (Codex) |
+| `github-copilot` | GitHub Copilot |
+| `google-gemini-cli` | Google Cloud Code Assist |
+| `google-antigravity` | Antigravity |
+
+## Environment variable (optional)
+
+For scripting, set `MULTI_SUB` instead of using the TUI:
 
 ```bash
 export MULTI_SUB="openai-codex:2,anthropic:1"
 ```
 
-This creates `openai-codex-2`, `openai-codex-3`, and `anthropic-2`. Env-based entries are merged with saved config (no duplicates).
-
-## Supported providers
-
-| Provider key | Service | Login flow |
-|---|---|---|
-| `anthropic` | Claude Pro/Max | Browser + paste code |
-| `openai-codex` | ChatGPT Plus/Pro (Codex) | Browser + local callback |
-| `github-copilot` | GitHub Copilot | Device code flow |
-| `google-gemini-cli` | Google Cloud Code Assist | Browser + local callback |
-| `google-antigravity` | Antigravity (Gemini 3, Claude, GPT-OSS) | Browser + local callback |
-
-## How it works
-
-- Subscriptions are saved in `~/.pi/agent/multi-pass.json`
-- Each extra subscription registers a new provider (e.g., `anthropic-2`) with its own OAuth flow and auth token
-- Models are cloned dynamically from the built-in provider via `getModels()`, so new models from pi updates appear automatically
-- Reuses the built-in OAuth login/refresh functions and API stream handlers
-- GitHub Copilot's dynamic base URL (`modifyModels`) is handled correctly
-- `MULTI_SUB` env var entries are merged additively with saved config
+Env entries merge with saved config (no duplicates).
 
 ## Config file
 
@@ -74,25 +113,25 @@ This creates `openai-codex-2`, `openai-codex-3`, and `anthropic-2`. Env-based en
     { "provider": "openai-codex", "index": 2, "label": "work" },
     { "provider": "openai-codex", "index": 3, "label": "personal" },
     { "provider": "anthropic", "index": 2 }
+  ],
+  "pools": [
+    {
+      "name": "codex-pool",
+      "baseProvider": "openai-codex",
+      "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
+      "enabled": true
+    }
   ]
 }
 ```
 
-You can edit this file directly. Changes take effect on next pi startup or `/reload`.
+## How it works
 
-## Example
-
-```
-/subs add
-> Select provider: openai-codex -- ChatGPT Plus/Pro (Codex)
-> Label: work
-> Created ChatGPT Codex #2 (work). Login now? Yes
-> Use /login and select "ChatGPT Codex #2" to authenticate.
-
-/subs status
-> ChatGPT Codex #2 (work) | logged in (token expires in 47m) | 8 models | saved
-> Anthropic #2             | not logged in                    | 23 models | env
-```
+- Each subscription registers a new provider (e.g., `anthropic-2`) with its own OAuth flow
+- Models are cloned dynamically via `getModels()` -- new models from pi updates appear automatically
+- Pools listen to `agent_end` events, detect rate limit errors, and call `setModel()` + `sendUserMessage()` to retry
+- Exhausted members have a 5-minute cooldown before re-entering rotation
+- All state persisted to `multi-pass.json`; pool exhaustion state is in-memory only
 
 ## License
 
