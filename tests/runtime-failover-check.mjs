@@ -111,6 +111,7 @@ class RuntimeHarness {
     this.sentPrompts = [];
     this.setModelCalls = [];
     this.cascadeState = null;
+    this.suppressNextStartTurn = false;
 
     for (const pool of config.pools) {
       if (!pool.enabled) continue;
@@ -142,6 +143,10 @@ class RuntimeHarness {
   }
 
   startTurn(prompt, currentModel) {
+    if (this.suppressNextStartTurn) {
+      this.suppressNextStartTurn = false;
+      return;
+    }
     if (!prompt) {
       this.cascadeState = null;
       return;
@@ -376,7 +381,10 @@ class RuntimeHarness {
 
     this.notify(formatFailoverTransition(pool.name, currentModel.provider, nextCandidate), "info");
     this.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-    if (prompt) this.sendUserMessage(prompt);
+    if (prompt) {
+      this.suppressNextStartTurn = true;
+      this.sendUserMessage(prompt);
+    }
     return true;
   }
 
@@ -673,8 +681,47 @@ function runSessionStatusChecks() {
   console.log("session-status checks passed");
 }
 
+async function runRetryStartTurnChecks() {
+  const config = createConfig();
+  const harness = new RuntimeHarness(config, [
+    "anthropic",
+    "anthropic-2",
+    "anthropic-3",
+    "openai-codex",
+    "openai-codex-2",
+    "google-gemini-cli",
+  ]);
+  const prompt = "what model are you?";
+
+  harness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
+  const first = await harness.handleError("429 rate limit", { provider: "anthropic", id: "claude-sonnet-4" }, prompt);
+  assert.equal(first, true);
+
+  harness.startTurn(prompt, { provider: "anthropic-2", id: "claude-sonnet-4" });
+  const second = await harness.handleError("429 rate limit", { provider: "anthropic-2", id: "claude-sonnet-4" }, prompt);
+  assert.equal(second, true);
+
+  const snapshot = harness.snapshot();
+  assert.deepEqual(snapshot.setModelCalls, [
+    "anthropic-2:claude-sonnet-4",
+    "anthropic-3:claude-sonnet-4",
+  ]);
+  assert.equal(
+    snapshot.notifications.some(
+      (entry) => entry.level === "warning" && entry.message.includes("openai-codex skipped (already attempted this turn)"),
+    ),
+    false,
+  );
+
+  console.log("retry-start-turn checks passed");
+}
+
 runCoreChecks();
 runSessionStatusChecks();
+
+if (process.argv.includes("--retry-start-turn")) {
+  await runRetryStartTurnChecks();
+}
 
 if (process.argv.includes("--pool-only")) {
   await runPoolOnlyChecks();
