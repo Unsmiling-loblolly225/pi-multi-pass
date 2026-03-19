@@ -88,10 +88,12 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 			return {
 				name: `Anthropic #${index}`,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAnthropic(
-						(url: string) => callbacks.onAuth({ url }),
-						() => callbacks.onPrompt({ message: "Paste the authorization code:" }),
-					);
+					return loginAnthropic({
+						onAuth: callbacks.onAuth,
+						onPrompt: callbacks.onPrompt,
+						onProgress: callbacks.onProgress,
+						onManualCodeInput: callbacks.onManualCodeInput,
+					});
 				},
 				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 					return refreshAnthropicToken(credentials.refresh);
