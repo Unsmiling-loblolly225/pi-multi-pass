@@ -1476,6 +1476,19 @@ export default function multiSub(pi: ExtensionAPI) {
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
+		const enabledChains = effective.chains.filter((chain) => chain.enabled);
+		const activeChain = enabledChains[0];
+		if (activeChain) {
+			const firstEnabledEntry = activeChain.entries.find((entry) => entry.enabled);
+			if (firstEnabledEntry) {
+				ctx.ui.setStatus(
+					"multi-pass",
+					`chain:${activeChain.name} | starts ${firstEnabledEntry.pool} -> ${firstEnabledEntry.model}`,
+				);
+				return;
+			}
+		}
+
 		const projectConf = loadProjectConfig(ctx.cwd);
 		if (projectConf) {
 			const poolCount = effective.pools.filter((p) => p.enabled).length;
