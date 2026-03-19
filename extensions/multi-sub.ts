@@ -248,15 +248,36 @@ interface PoolConfig {
 	enabled: boolean;
 }
 
+interface ChainEntryConfig {
+	/** Target pool name to enter when traversing the chain */
+	pool: string;
+	/** Model to select when entering the target pool */
+	model: string;
+	/** Whether this chain entry participates in traversal */
+	enabled: boolean;
+}
+
+interface ChainConfig {
+	/** Chain name (user-defined) */
+	name: string;
+	/** Ordered chain traversal entries */
+	entries: ChainEntryConfig[];
+	/** Whether chain traversal is enabled */
+	enabled: boolean;
+}
+
 interface MultiPassConfig {
 	subscriptions: SubEntry[];
 	pools: PoolConfig[];
+	chains: ChainConfig[];
 }
 
 /** Project-level config (.pi/multi-pass.json) */
 interface ProjectConfig {
 	/** Override pools for this project. If set, replaces global pools. */
 	pools?: PoolConfig[];
+	/** Override chains for this project. If set, replaces global chains. */
+	chains?: ChainConfig[];
 	/** Restrict which subscriptions can be used. Provider names (e.g. "openai-codex-2").
 	 *  If set, only these subs (plus the originals) are available in this project.
 	 *  If not set, all global subs are available. */
@@ -267,6 +288,7 @@ interface ProjectConfig {
 interface EffectiveConfig {
 	subscriptions: SubEntry[];
 	pools: PoolConfig[];
+	chains: ChainConfig[];
 	/** Which project config was loaded from, if any */
 	projectConfigPath?: string;
 }
@@ -279,17 +301,36 @@ function projectConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "multi-pass.json");
 }
 
+function emptyMultiPassConfig(): MultiPassConfig {
+	return { subscriptions: [], pools: [], chains: [] };
+}
+
+function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
+	const parsed = raw && typeof raw === "object" ? (raw as Partial<MultiPassConfig>) : {};
+	return {
+		subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
+		pools: Array.isArray(parsed.pools) ? parsed.pools : [],
+		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
+	};
+}
+
+function normalizeProjectConfig(raw: unknown): ProjectConfig {
+	const parsed = raw && typeof raw === "object" ? (raw as Partial<ProjectConfig>) : {};
+	const config: ProjectConfig = {};
+	if (Array.isArray(parsed.pools)) config.pools = parsed.pools;
+	if (Array.isArray(parsed.chains)) config.chains = parsed.chains;
+	if (Array.isArray(parsed.allowedSubs)) config.allowedSubs = parsed.allowedSubs;
+	return config;
+}
+
 function loadGlobalConfig(): MultiPassConfig {
 	const path = globalConfigPath();
-	if (!existsSync(path)) return { subscriptions: [], pools: [] };
+	if (!existsSync(path)) return emptyMultiPassConfig();
 	try {
 		const raw = JSON.parse(readFileSync(path, "utf-8"));
-		return {
-			subscriptions: raw.subscriptions || [],
-			pools: raw.pools || [],
-		};
+		return normalizeMultiPassConfig(raw);
 	} catch {
-		return { subscriptions: [], pools: [] };
+		return emptyMultiPassConfig();
 	}
 }
 
@@ -297,7 +338,7 @@ function loadProjectConfig(cwd: string): ProjectConfig | undefined {
 	const path = projectConfigPath(cwd);
 	if (!existsSync(path)) return undefined;
 	try {
-		return JSON.parse(readFileSync(path, "utf-8")) as ProjectConfig;
+		return normalizeProjectConfig(JSON.parse(readFileSync(path, "utf-8")));
 	} catch {
 		return undefined;
 	}
@@ -308,7 +349,11 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	const project = loadProjectConfig(cwd);
 
 	if (!project) {
-		return { subscriptions: global.subscriptions, pools: global.pools };
+		return {
+			subscriptions: global.subscriptions,
+			pools: global.pools,
+			chains: global.chains,
+		};
 	}
 
 	// Subscriptions are always global, but filter if allowedSubs is set
@@ -318,12 +363,14 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 		subs = global.subscriptions.filter((s) => allowed.has(subProviderName(s)));
 	}
 
-	// Pools: project overrides global if defined
+	// Pools/chains: project overrides global if defined
 	const pools = project.pools !== undefined ? project.pools : global.pools;
+	const chains = project.chains !== undefined ? project.chains : global.chains;
 
 	return {
 		subscriptions: subs,
 		pools,
+		chains,
 		projectConfigPath: projectConfigPath(cwd),
 	};
 }
@@ -505,33 +552,53 @@ class PoolManager {
 	/** Map from provider name -> pool name (for quick lookup) */
 	private providerToPool: Map<string, string> = new Map();
 	private pi: ExtensionAPI;
-	private lastRetryPrompt: string | null = null;
-	private retryInProgress = false;
+	private cascadeState: FailoverCascadeState | null = null;
+	private suppressNextStartTurn = false;
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+	}
+
+	private getOrCreatePoolState(poolName: string): PoolState {
+		let state = this.poolStates.get(poolName);
+		if (!state) {
+			state = {
+				currentIndex: 0,
+				exhausted: new Map(),
+				cooldownMs: 5 * 60 * 1000, // 5 min default cooldown
+			};
+			this.poolStates.set(poolName, state);
+		}
+		return state;
 	}
 
 	loadPools(configs: PoolConfig[]): void {
 		this.pools.clear();
 		this.providerToPool.clear();
 
+		const activePoolNames = new Set<string>();
 		for (const pool of configs) {
 			if (!pool.enabled) continue;
+			activePoolNames.add(pool.name);
 			this.pools.set(pool.name, pool);
 
-			// Initialize state if not exists
-			if (!this.poolStates.has(pool.name)) {
-				this.poolStates.set(pool.name, {
-					currentIndex: 0,
-					exhausted: new Map(),
-					cooldownMs: 5 * 60 * 1000, // 5 min default cooldown
-				});
+			const state = this.getOrCreatePoolState(pool.name);
+			state.currentIndex = pool.members.length > 0 ? state.currentIndex % pool.members.length : 0;
+			for (const member of Array.from(state.exhausted.keys())) {
+				if (!pool.members.includes(member)) {
+					state.exhausted.delete(member);
+				}
 			}
 
 			// Map each member to this pool
 			for (const member of pool.members) {
 				this.providerToPool.set(member, pool.name);
+			}
+		}
+
+		for (const poolName of Array.from(this.poolStates.keys())) {
+			if (!activePoolNames.has(poolName)) {
+				this.poolStates.delete(poolName);
 			}
 		}
 	}
@@ -547,17 +614,12 @@ class PoolManager {
 		pool: PoolConfig,
 		authStorage: { hasAuth(provider: string): boolean },
 	): string[] {
-		const state = this.poolStates.get(pool.name);
-		if (!state) return pool.members;
-
+		const state = this.getOrCreatePoolState(pool.name);
 		const now = Date.now();
 		return pool.members.filter((member) => {
-			// Must have auth
 			if (!authStorage.hasAuth(member)) return false;
-			// Check if exhausted and still in cooldown
 			const exhaustedAt = state.exhausted.get(member);
 			if (exhaustedAt && now - exhaustedAt < state.cooldownMs) return false;
-			// Clear expired exhaustion
 			if (exhaustedAt && now - exhaustedAt >= state.cooldownMs) {
 				state.exhausted.delete(member);
 			}
@@ -565,12 +627,183 @@ class PoolManager {
 		});
 	}
 
+	isMemberExhausted(pool: PoolConfig, provider: string): boolean {
+		const state = this.getOrCreatePoolState(pool.name);
+		const exhaustedAt = state.exhausted.get(provider);
+		if (!exhaustedAt) return false;
+		if (Date.now() - exhaustedAt >= state.cooldownMs) {
+			state.exhausted.delete(provider);
+			return false;
+		}
+		return true;
+	}
+
+	getEnabledChains(config: MultiPassConfig): ChainConfig[] {
+		return config.chains.filter((chain) => chain.enabled);
+	}
+
+	findApplicableChain(poolName: string, config: MultiPassConfig): {
+		chain: ChainConfig;
+		index: number;
+	} | undefined {
+		for (const chain of this.getEnabledChains(config)) {
+			const index = chain.entries.findIndex((entry) => entry.pool === poolName);
+			if (index >= 0) {
+				return { chain, index };
+			}
+		}
+		return undefined;
+	}
+
+	buildFailoverPlan(
+		currentModel: Model<Api>,
+		config: MultiPassConfig,
+		authStorage: { hasAuth(provider: string): boolean },
+		options?: FailoverPlanOptions,
+	): FailoverPlan {
+		const attemptedProviders = options?.attemptedProviders ?? new Set<string>();
+		const visitedChainIndexes = options?.visitedChainIndexes ?? new Set<number>();
+		const pool = this.getPoolForProvider(currentModel.provider);
+		if (!pool) {
+			return { candidates: [], skips: [] };
+		}
+
+		const skips: FailoverSkip[] = [];
+		const candidates: FailoverCandidate[] = [];
+		const poolSize = pool.members.length;
+		const currentIndex = pool.members.indexOf(currentModel.provider);
+		const startIndex = currentIndex >= 0 ? currentIndex : 0;
+
+		for (let step = 1; step <= poolSize; step++) {
+			const candidateIndex = poolSize <= 0 ? -1 : (startIndex + step) % poolSize;
+			if (candidateIndex < 0) break;
+			const candidate = pool.members[candidateIndex];
+			if (candidate === currentModel.provider) continue;
+			if (attemptedProviders.has(candidate)) {
+				skips.push({
+					type: "pool-member",
+					poolName: pool.name,
+					reason: "already-attempted",
+					detail: `${candidate} skipped (already attempted this turn)`,
+				});
+				continue;
+			}
+			const skip = classifyPoolMemberSkip(
+				pool.name,
+				candidate,
+				authStorage,
+				this.isMemberExhausted(pool, candidate),
+			);
+			if (skip) {
+				skips.push(skip);
+				continue;
+			}
+			candidates.push({
+				poolName: pool.name,
+				provider: candidate,
+				modelId: currentModel.id,
+				source: "pool",
+			});
+		}
+
+		const applicable = this.findApplicableChain(pool.name, config);
+		if (!applicable) {
+			return { pool, candidates, skips };
+		}
+
+		for (let chainIndex = applicable.index + 1; chainIndex < applicable.chain.entries.length; chainIndex++) {
+			const entry = applicable.chain.entries[chainIndex];
+			if (visitedChainIndexes.has(chainIndex)) {
+				skips.push({
+					type: "chain-entry",
+					poolName: entry.pool,
+					reason: "already-visited-chain-entry",
+					detail: `${entry.pool} -> ${entry.model} skipped (chain entry already visited this turn)`,
+					chainName: applicable.chain.name,
+					chainIndex,
+				});
+				continue;
+			}
+			const entrySkip = classifyChainEntrySkip(applicable.chain, chainIndex, entry, config);
+			if (entrySkip) {
+				skips.push(entrySkip);
+				continue;
+			}
+			const targetPool = config.pools.find((candidate) => candidate.name === entry.pool);
+			if (!targetPool) {
+				skips.push({
+					type: "chain-entry",
+					poolName: entry.pool,
+					reason: "missing-pool",
+					detail: `${entry.pool} -> ${entry.model} skipped (pool missing)`,
+					chainName: applicable.chain.name,
+					chainIndex,
+				});
+				continue;
+			}
+			let foundEligible = false;
+			for (const member of targetPool.members) {
+				if (attemptedProviders.has(member)) {
+					skips.push({
+						type: "pool-member",
+						poolName: targetPool.name,
+						reason: "already-attempted",
+						detail: `${member} skipped (already attempted this turn)`,
+						chainName: applicable.chain.name,
+						chainIndex,
+					});
+					continue;
+				}
+				const memberSkip = classifyPoolMemberSkip(
+					targetPool.name,
+					member,
+					authStorage,
+					this.isMemberExhausted(targetPool, member),
+				);
+				if (memberSkip) {
+					skips.push({
+						...memberSkip,
+						chainName: applicable.chain.name,
+						chainIndex,
+					});
+					continue;
+				}
+				foundEligible = true;
+				candidates.push({
+					poolName: targetPool.name,
+					provider: member,
+					modelId: entry.model,
+					source: "chain",
+					chainName: applicable.chain.name,
+					chainIndex,
+				});
+			}
+			if (!foundEligible) {
+				skips.push({
+					type: "chain-entry",
+					poolName: targetPool.name,
+					reason: "no-eligible-members",
+					detail: `${targetPool.name} -> ${entry.model} skipped (no eligible members)`,
+					chainName: applicable.chain.name,
+					chainIndex,
+				});
+			}
+		}
+
+		return {
+			pool,
+			chain: applicable.chain,
+			currentChainIndex: applicable.index,
+			candidates,
+			skips,
+		};
+	}
+
 	/** Mark a member as exhausted (hit rate limit) */
 	markExhausted(providerName: string): void {
 		const poolName = this.providerToPool.get(providerName);
 		if (!poolName) return;
-		const state = this.poolStates.get(poolName);
-		if (!state) return;
+		const state = this.getOrCreatePoolState(poolName);
 		state.exhausted.set(providerName, Date.now());
 	}
 
@@ -580,22 +813,94 @@ class PoolManager {
 		currentProvider: string,
 		authStorage: { hasAuth(provider: string): boolean },
 	): string | undefined {
+		const state = this.getOrCreatePoolState(pool.name);
 		const available = this.getAvailableMembers(pool, authStorage);
-		// Filter out current provider
-		const candidates = available.filter((m) => m !== currentProvider);
-		if (candidates.length === 0) return undefined;
+		if (available.length === 0) return undefined;
 
-		const state = this.poolStates.get(pool.name);
-		if (!state) return candidates[0];
+		const poolSize = pool.members.length;
+		if (poolSize <= 1) {
+			return available[0] === currentProvider ? undefined : available[0];
+		}
 
-		// Round-robin: advance index
-		state.currentIndex = (state.currentIndex + 1) % candidates.length;
-		return candidates[state.currentIndex];
+		const currentIndex = pool.members.indexOf(currentProvider);
+		const startIndex = currentIndex >= 0 ? currentIndex : state.currentIndex % poolSize;
+
+		for (let step = 1; step <= poolSize; step++) {
+			const candidateIndex = (startIndex + step) % poolSize;
+			const candidate = pool.members[candidateIndex];
+			if (candidate === currentProvider) continue;
+			if (!available.includes(candidate)) continue;
+			state.currentIndex = candidateIndex;
+			return candidate;
+		}
+
+		return undefined;
+	}
+
+	private ensureCascadeState(prompt: string | null, currentModel: Model<Api>): FailoverCascadeState {
+		if (!prompt) {
+			const fallbackState: FailoverCascadeState = {
+				prompt: "",
+				attemptedProviders: new Set([currentModel.provider]),
+				visitedChainIndexes: new Set<number>(),
+			};
+			this.cascadeState = fallbackState;
+			return fallbackState;
+		}
+
+		if (!this.cascadeState || this.cascadeState.prompt !== prompt) {
+			this.cascadeState = {
+				prompt,
+				attemptedProviders: new Set([currentModel.provider]),
+				visitedChainIndexes: new Set<number>(),
+			};
+		} else {
+			this.cascadeState.attemptedProviders.add(currentModel.provider);
+		}
+
+		return this.cascadeState;
+	}
+
+	startTurn(prompt: string | null, currentModel?: Model<Api>): void {
+		if (this.suppressNextStartTurn) {
+			this.suppressNextStartTurn = false;
+			return;
+		}
+		if (!prompt) {
+			this.cascadeState = null;
+			return;
+		}
+		if (!this.cascadeState || this.cascadeState.prompt !== prompt) {
+			this.cascadeState = {
+				prompt,
+				attemptedProviders: new Set(currentModel ? [currentModel.provider] : []),
+				visitedChainIndexes: new Set<number>(),
+			};
+			return;
+		}
+		if (currentModel) {
+			this.cascadeState.attemptedProviders.add(currentModel.provider);
+		}
+	}
+
+	clearCascadeState(): void {
+		this.cascadeState = null;
+	}
+
+	getCascadeStateSnapshot():
+		| { prompt: string; attemptedProviders: string[]; visitedChainIndexes: number[] }
+		| null {
+		if (!this.cascadeState) return null;
+		return {
+			prompt: this.cascadeState.prompt,
+			attemptedProviders: [...this.cascadeState.attemptedProviders],
+			visitedChainIndexes: [...this.cascadeState.visitedChainIndexes],
+		};
 	}
 
 	/**
 	 * Handle an error: if it's a rate limit and the provider is in a pool,
-	 * rotate to the next member and retry.
+	 * build an ordered failover plan, switch to the first usable candidate, and retry.
 	 * Returns true if rotation happened.
 	 */
 	async handleError(
@@ -603,71 +908,82 @@ class PoolManager {
 		currentModel: Model<Api> | undefined,
 		ctx: ExtensionContext,
 		lastUserPrompt: string | null,
+		config: MultiPassConfig,
 	): Promise<boolean> {
 		if (!currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
-		if (this.retryInProgress) return false;
 
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) return false;
 
-		// Mark current as exhausted
+		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
+
+		// Mark current as exhausted before planning the forward-only cascade.
 		this.markExhausted(currentModel.provider);
 
-		// Find next member
-		const nextProvider = this.getNextMember(
-			pool,
-			currentModel.provider,
+		const plan = this.buildFailoverPlan(
+			currentModel,
+			config,
 			ctx.modelRegistry.authStorage,
+			{
+				attemptedProviders: cascade.attemptedProviders,
+				visitedChainIndexes: cascade.visitedChainIndexes,
+			},
 		);
-
-		if (!nextProvider) {
+		const continuation = formatFailoverContinuation(plan.candidates[0]);
+		for (const skip of plan.skips) {
 			ctx.ui.notify(
-				`[pool:${pool.name}] All members exhausted. Waiting for cooldown.`,
+				`[pool:${skip.poolName}] ${skip.detail}; ${continuation}`,
 				"warning",
 			);
+		}
+
+		const nextCandidate = plan.candidates[0];
+		if (!nextCandidate) {
+			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
+			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
 		}
 
-		// Find the same model ID on the next provider
-		const nextModel = ctx.modelRegistry.find(nextProvider, currentModel.id);
+		const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
 		if (!nextModel) {
 			ctx.ui.notify(
-				`[pool:${pool.name}] Model ${currentModel.id} not found on ${nextProvider}`,
+				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
 				"warning",
 			);
+			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
+			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
 		}
 
-		// Switch model
 		const success = await this.pi.setModel(nextModel);
 		if (!success) {
 			ctx.ui.notify(
-				`[pool:${pool.name}] Failed to switch to ${nextProvider} (no auth)`,
+				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
 				"warning",
 			);
+			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
+			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
 		}
 
-		const fromLabel = currentModel.provider;
-		const toLabel = nextProvider;
+		cascade.attemptedProviders.add(nextCandidate.provider);
+		if (typeof nextCandidate.chainIndex === "number") {
+			cascade.visitedChainIndexes.add(nextCandidate.chainIndex);
+		}
+
 		ctx.ui.notify(
-			`[pool:${pool.name}] Rate limited on ${fromLabel}, rotating to ${toLabel}`,
+			formatFailoverTransition(pool.name, currentModel.provider, nextCandidate),
 			"info",
 		);
-		ctx.ui.setStatus("multi-pass", `pool:${pool.name} -> ${toLabel}`);
+		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
 
-		// Retry the last prompt
 		if (lastUserPrompt) {
-			this.retryInProgress = true;
+			this.suppressNextStartTurn = true;
 			this.pi.sendUserMessage(lastUserPrompt);
 		}
 
 		return true;
-	}
-
-	clearRetryFlag(): void {
-		this.retryInProgress = false;
 	}
 
 	getPoolConfigs(): PoolConfig[] {
@@ -936,37 +1252,76 @@ function getAllProvidersForBase(
 	return providers;
 }
 
-async function handlePoolCreate(
+function createPoolValidationMessage(members: string[]): string | null {
+	if (members.length < 1) {
+		return "Pool needs at least 1 member.";
+	}
+	return null;
+}
+
+function buildPoolConfig(input: {
+	name: string;
+	baseProvider: string;
+	members: string[];
+	enabled?: boolean;
+}): { ok: true; pool: PoolConfig } | { ok: false; error: string } {
+	const name = input.name.trim();
+	if (!name) {
+		return { ok: false, error: "Pool name is required." };
+	}
+	const validation = createPoolValidationMessage(input.members);
+	if (validation) {
+		return { ok: false, error: validation };
+	}
+	return {
+		ok: true,
+		pool: {
+			name,
+			baseProvider: input.baseProvider,
+			members: [...input.members],
+			enabled: input.enabled ?? true,
+		},
+	};
+}
+
+function persistPoolConfig(
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): { action: "created" | "updated"; config: MultiPassConfig } {
+	const existingIdx = config.pools.findIndex((candidate) => candidate.name === pool.name);
+	if (existingIdx >= 0) {
+		config.pools[existingIdx] = pool;
+		return { action: "updated", config };
+	}
+	config.pools.push(pool);
+	return { action: "created", config };
+}
+
+async function promptForPoolDefinition(
 	ctx: ExtensionCommandContext,
-	poolManager: PoolManager,
-): Promise<void> {
-	// Pick base provider
+	options?: {
+		allowOverwrite?: boolean;
+		resumeChainName?: string;
+	},
+): Promise<PoolConfig | undefined> {
+	const config = loadGlobalConfig();
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
 	const providerLabels = SUPPORTED_PROVIDERS.map((p) => {
 		const t = PROVIDER_TEMPLATES[p];
 		return `${p} -- ${t.displayName}`;
 	});
 
 	const selectedProvider = await ctx.ui.select("Pool base provider", providerLabels);
-	if (!selectedProvider) return;
+	if (!selectedProvider) return undefined;
 	const baseProvider = selectedProvider.split(" -- ")[0];
 
-	// Pool name
 	const poolName = await ctx.ui.input("Pool name", `e.g. ${baseProvider}-pool`);
-	if (!poolName?.trim()) return;
+	if (!poolName?.trim()) return undefined;
 
-	const config = loadGlobalConfig();
-	const envEntries = parseEnvConfig();
-	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
-
-	// Get all providers for this base type
 	const allProviders = getAllProvidersForBase(baseProvider, allSubs);
-
-	// Filter to only authenticated ones
 	const authedProviders = allProviders.filter((p) =>
 		ctx.modelRegistry.authStorage.hasAuth(p),
-	);
-	const unauthedProviders = allProviders.filter(
-		(p) => !ctx.modelRegistry.authStorage.hasAuth(p),
 	);
 
 	if (authedProviders.length === 0) {
@@ -974,23 +1329,16 @@ async function handlePoolCreate(
 			`No authenticated ${baseProvider} subscriptions found. Login first with /subs login.`,
 			"warning",
 		);
-		return;
+		return undefined;
 	}
 
-	// Let user pick which to include
-	const memberLabels = allProviders.map((p) => {
-		const authed = ctx.modelRegistry.authStorage.hasAuth(p);
-		return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
-	});
-
-	// Use multiple selects (select each to toggle, done when they cancel)
 	const members: string[] = [];
 	let selecting = true;
 	while (selecting) {
 		const remaining = allProviders.filter((p) => !members.includes(p));
 		if (remaining.length === 0) break;
 
-		const options = [
+		const optionsList = [
 			`--- Selected (${members.length}): ${members.join(", ") || "none"} ---`,
 			...remaining.map((p) => {
 				const authed = ctx.modelRegistry.authStorage.hasAuth(p);
@@ -999,15 +1347,19 @@ async function handlePoolCreate(
 			"[Done - create pool]",
 		];
 
-		const picked = await ctx.ui.select("Add members (Esc when done)", options);
-		if (!picked || picked.startsWith("---")) {
-			if (members.length > 0) selecting = false;
-			else {
-				ctx.ui.notify("Select at least one member.", "warning");
-			}
+		const picked = await ctx.ui.select("Add members ([Done] saves, Esc cancels)", optionsList);
+		if (!picked) {
+			ctx.ui.notify(`Cancelled pool creation${poolName ? ` for "${poolName}"` : ""}.`, "info");
+			return undefined;
+		}
+		if (picked.startsWith("---")) {
 			continue;
 		}
 		if (picked === "[Done - create pool]") {
+			if (members.length === 0) {
+				ctx.ui.notify("Select at least one member.", "warning");
+				continue;
+			}
 			selecting = false;
 			continue;
 		}
@@ -1018,38 +1370,117 @@ async function handlePoolCreate(
 		}
 	}
 
-	if (members.length < 2) {
-		ctx.ui.notify("Pool needs at least 2 members for rotation to be useful.", "warning");
-		return;
+	const built = buildPoolConfig({ name: poolName, baseProvider, members, enabled: true });
+	if (!built.ok) {
+		ctx.ui.notify(built.error, "warning");
+		return undefined;
 	}
 
-	const pool: PoolConfig = {
-		name: poolName.trim(),
-		baseProvider,
-		members,
-		enabled: true,
-	};
-
-	// Check for duplicate name
-	const existingIdx = config.pools.findIndex((p) => p.name === pool.name);
-	if (existingIdx >= 0) {
+	const existing = config.pools.find((pool) => pool.name === built.pool.name);
+	if (existing && !options?.allowOverwrite) {
+		ctx.ui.notify(`Pool "${built.pool.name}" already exists.`, "warning");
+		return undefined;
+	}
+	if (existing && options?.allowOverwrite) {
 		const overwrite = await ctx.ui.confirm(
 			"Pool exists",
-			`Pool "${pool.name}" already exists. Overwrite?`,
+			`Pool "${built.pool.name}" already exists. Overwrite?`,
 		);
-		if (!overwrite) return;
-		config.pools[existingIdx] = pool;
-	} else {
-		config.pools.push(pool);
+		if (!overwrite) return undefined;
 	}
 
-	saveGlobalConfig(config);
-	poolManager.loadPools(config.pools);
+	if (options?.resumeChainName) {
+		ctx.ui.notify(
+			`Prepared pool "${built.pool.name}" for chain "${options.resumeChainName}".`,
+			"info",
+		);
+	}
 
+	return built.pool;
+}
+
+async function createAndPersistPool(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	options?: {
+		allowOverwrite?: boolean;
+		resumeChainName?: string;
+	},
+): Promise<PoolConfig | undefined> {
+	const pool = await promptForPoolDefinition(ctx, options);
+	if (!pool) return undefined;
+
+	const config = loadGlobalConfig();
+	const persisted = persistPoolConfig(config, pool);
+	saveGlobalConfig(persisted.config);
+	poolManager.loadPools(persisted.config.pools);
+
+	const resumeSuffix = options?.resumeChainName
+		? ` Chain builder resumed for "${options.resumeChainName}".`
+		: "";
 	ctx.ui.notify(
-		`Created pool "${pool.name}" with ${members.length} members: ${members.join(", ")}`,
+		`${persisted.action === "created" ? "Created" : "Updated"} pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.${resumeSuffix}`,
 		"info",
 	);
+	return pool;
+}
+
+function getSelectableModelsForPool(pool: PoolConfig): string[] {
+	return (getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id);
+}
+
+function createChainValidationError(
+	config: MultiPassConfig,
+	chain: ChainConfig,
+): string | null {
+	if (!chain.name.trim()) {
+		return "Chain name is required.";
+	}
+	if (findChainByName(config.chains, chain.name)) {
+		return `Chain "${chain.name}" already exists.`;
+	}
+	if (chain.entries.length === 0) {
+		return `Chain "${chain.name}" needs at least 1 entry.`;
+	}
+
+	for (const entry of chain.entries) {
+		const pool = config.pools.find((candidate) => candidate.name === entry.pool);
+		if (!pool) {
+			return `Chain entry pool "${entry.pool}" does not exist.`;
+		}
+		const selectableModels = getSelectableModelsForPool(pool);
+		if (selectableModels.length === 0) {
+			return `Pool "${pool.name}" has no selectable models for ${pool.baseProvider}.`;
+		}
+		if (!selectableModels.includes(entry.model)) {
+			return `Model "${entry.model}" is not available for pool "${pool.name}".`;
+		}
+	}
+
+	return null;
+}
+
+function buildChainConfig(
+	config: MultiPassConfig,
+	input: { name: string; entries: ChainEntryConfig[]; enabled?: boolean },
+): { ok: true; chain: ChainConfig } | { ok: false; error: string } {
+	const chain: ChainConfig = {
+		name: input.name.trim(),
+		entries: input.entries.map((entry) => ({ ...entry })),
+		enabled: input.enabled ?? true,
+	};
+	const validationError = createChainValidationError(config, chain);
+	if (validationError) {
+		return { ok: false, error: validationError };
+	}
+	return { ok: true, chain };
+}
+
+async function handlePoolCreate(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	await createAndPersistPool(ctx, poolManager, { allowOverwrite: true });
 }
 
 async function handlePoolList(
@@ -1116,9 +1547,10 @@ async function handlePoolRemove(
 		return;
 	}
 
-	const options = config.pools.map(
-		(p) => `${p.name} (${p.members.length} members)`,
-	);
+	const options = config.pools.map((p) => {
+		const memberLabel = p.members.length === 1 ? "member" : "members";
+		return `${p.name} (${p.members.length} ${memberLabel})`;
+	});
 
 	const selected = await ctx.ui.select("Remove pool", options);
 	if (!selected) return;
@@ -1139,6 +1571,87 @@ async function handlePoolRemove(
 	ctx.ui.notify(`Removed pool "${pool.name}"`, "info");
 }
 
+function summarizePoolHealth(
+	pool: PoolConfig,
+	authStorage: { hasAuth(provider: string): boolean },
+	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+): {
+	availableCount: number;
+	authedCount: number;
+	memberCount: number;
+	unavailableCount: number;
+	statusLabel: string;
+} {
+	const availableMembers = pool.enabled
+		? poolManager.getAvailableMembers(pool, authStorage)
+		: [];
+	const availableSet = new Set(availableMembers);
+	let authedCount = 0;
+	for (const member of pool.members) {
+		if (authStorage.hasAuth(member)) authedCount += 1;
+	}
+	const availableCount = availableMembers.length;
+	const memberCount = pool.members.length;
+	const unavailableCount = memberCount - availableCount;
+	let statusLabel = `${availableCount}/${memberCount} available`;
+	if (!pool.enabled) {
+		statusLabel += " | pool disabled";
+	} else if (memberCount === 0) {
+		statusLabel += " | no members configured";
+	} else if (availableCount === 0) {
+		if (authedCount === 0) {
+			statusLabel += " | no auth";
+		} else {
+			statusLabel += " | cooldown/no eligible members";
+		}
+	}
+	return {
+		availableCount,
+		authedCount,
+		memberCount,
+		unavailableCount,
+		statusLabel,
+	};
+}
+
+function formatPoolListLine(
+	pool: PoolConfig,
+	authStorage: { hasAuth(provider: string): boolean },
+	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+): string {
+	const summary = summarizePoolHealth(pool, authStorage, poolManager);
+	const status = pool.enabled ? "enabled" : "disabled";
+	return `${pool.name} | ${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
+}
+
+function formatPoolStatusLines(
+	pool: PoolConfig,
+	authStorage: { hasAuth(provider: string): boolean },
+	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+): string[] {
+	const summary = summarizePoolHealth(pool, authStorage, poolManager);
+	const lines = [
+		`=== ${pool.name} (${pool.enabled ? "enabled" : "disabled"}) ===`,
+		`provider: ${pool.baseProvider}`,
+		`members: ${summary.memberCount}`,
+		`availability: ${summary.statusLabel}`,
+	];
+	if (pool.members.length === 0) {
+		lines.push("  [no members configured]");
+		return lines;
+	}
+	for (const member of pool.members) {
+		const authed = authStorage.hasAuth(member);
+		const exhausted = pool.enabled && authed && poolManager.isMemberExhausted(pool, member);
+		let status = authed ? "logged in" : "not logged in";
+		if (exhausted) status += " (rate limited, cooling down)";
+		if (pool.enabled && authed && !exhausted) status += " (available)";
+		if (!pool.enabled && authed) status += " (pool disabled)";
+		lines.push(`  ${member} -- ${status}`);
+	}
+	return lines;
+}
+
 async function handlePoolStatus(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
@@ -1151,19 +1664,512 @@ async function handlePoolStatus(
 
 	const lines: string[] = [];
 	for (const pool of config.pools) {
-		lines.push(`=== ${pool.name} (${pool.enabled ? "enabled" : "disabled"}) ===`);
-		for (const member of pool.members) {
-			const authed = ctx.modelRegistry.authStorage.hasAuth(member);
-			const available = poolManager
-				.getAvailableMembers(pool, ctx.modelRegistry.authStorage)
-				.includes(member);
-			let status = authed ? "logged in" : "not logged in";
-			if (authed && !available) status += " (rate limited, cooling down)";
-			lines.push(`  ${member} -- ${status}`);
-		}
+		lines.push(
+			...formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager),
+		);
 	}
 
 	await ctx.ui.select("Pool Status", lines);
+}
+
+function findChainByName(chains: ChainConfig[], name: string): ChainConfig | undefined {
+	return chains.find((chain) => chain.name === name);
+}
+
+function getChainEntryIssue(entry: ChainEntryConfig, config: MultiPassConfig): string | null {
+	const pool = config.pools.find((candidate) => candidate.name === entry.pool);
+	if (!pool) {
+		return `invalid pool: ${entry.pool} missing`;
+	}
+	if (!pool.enabled) {
+		return `invalid pool: ${pool.name} disabled`;
+	}
+	const selectableModels = getSelectableModelsForPool(pool);
+	if (selectableModels.length === 0) {
+		return `invalid model: no selectable models for ${pool.baseProvider}`;
+	}
+	if (!selectableModels.includes(entry.model)) {
+		return `invalid model: ${entry.model} unavailable for ${pool.name}`;
+	}
+	return null;
+}
+
+interface FailoverCandidate {
+	poolName: string;
+	provider: string;
+	modelId: string;
+	source: "pool" | "chain";
+	chainName?: string;
+	chainIndex?: number;
+}
+
+interface FailoverSkip {
+	type: "pool-member" | "chain-entry";
+	poolName: string;
+	reason:
+		| "no-auth"
+		| "exhausted"
+		| "missing-pool"
+		| "disabled-entry"
+		| "disabled-pool"
+		| "unavailable-model"
+		| "no-eligible-members"
+		| "already-attempted"
+		| "already-visited-chain-entry";
+	detail: string;
+	chainName?: string;
+	chainIndex?: number;
+}
+
+interface FailoverPlanOptions {
+	attemptedProviders?: Set<string>;
+	visitedChainIndexes?: Set<number>;
+}
+
+interface FailoverPlan {
+	pool?: PoolConfig;
+	chain?: ChainConfig;
+	currentChainIndex?: number;
+	candidates: FailoverCandidate[];
+	skips: FailoverSkip[];
+}
+
+interface FailoverCascadeState {
+	prompt: string;
+	attemptedProviders: Set<string>;
+	visitedChainIndexes: Set<number>;
+}
+
+function formatFailoverTarget(candidate: Pick<FailoverCandidate, "provider" | "modelId">): string {
+	return `${candidate.provider} (${candidate.modelId})`;
+}
+
+function formatFailoverStatus(
+	candidate:
+		| Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex">
+		| null,
+	fallbackPoolName?: string,
+): string {
+	if (!candidate) {
+		return fallbackPoolName
+			? `pool:${fallbackPoolName} | cascade exhausted | no eligible target`
+			: "cascade exhausted | no eligible target";
+	}
+	const scope = candidate.source === "chain"
+		? `chain:${candidate.chainName}#${(candidate.chainIndex ?? 0) + 1}`
+		: `pool:${candidate.poolName}`;
+	return `${scope} | active ${formatFailoverTarget(candidate)}`;
+}
+
+function formatFailoverContinuation(
+	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex"> | undefined,
+): string {
+	if (!nextCandidate) {
+		return "cascade exhausted; no later eligible target";
+	}
+	const phase = nextCandidate.source === "chain"
+		? `continuing forward to chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
+		: `continuing within pool ${nextCandidate.poolName}`;
+	return `${phase} -> ${formatFailoverTarget(nextCandidate)}`;
+}
+
+function formatFailoverTransition(
+	poolName: string,
+	currentProvider: string,
+	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex">,
+): string {
+	const phase = nextCandidate.source === "chain"
+		? `advancing to chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
+		: `rotating within pool ${poolName}`;
+	return `[pool:${poolName}] Rate limited on ${currentProvider}; ${phase}; active ${formatFailoverTarget(nextCandidate)}`;
+}
+
+function formatFailoverExhausted(poolName: string, currentProvider: string): string {
+	return `[pool:${poolName}] Failover exhausted after ${currentProvider}; no eligible target remained in this cascade.`;
+}
+
+function classifyPoolMemberSkip(
+	poolName: string,
+	provider: string,
+	authStorage: { hasAuth(provider: string): boolean },
+	exhausted: boolean,
+): FailoverSkip | null {
+	if (!authStorage.hasAuth(provider)) {
+		return {
+			type: "pool-member",
+			poolName,
+			reason: "no-auth",
+			detail: `${provider} skipped (no auth)` ,
+		};
+	}
+	if (exhausted) {
+		return {
+			type: "pool-member",
+			poolName,
+			reason: "exhausted",
+			detail: `${provider} skipped (cooldown active)`,
+		};
+	}
+	return null;
+}
+
+function classifyChainEntrySkip(
+	chain: ChainConfig,
+	chainIndex: number,
+	entry: ChainEntryConfig,
+	config: MultiPassConfig,
+): FailoverSkip | null {
+	if (!entry.enabled) {
+		return {
+			type: "chain-entry",
+			poolName: entry.pool,
+			reason: "disabled-entry",
+			detail: `${entry.pool} -> ${entry.model} skipped (entry disabled)`,
+			chainName: chain.name,
+			chainIndex,
+		};
+	}
+	const issue = getChainEntryIssue(entry, config);
+	if (!issue) return null;
+	const reason = issue.includes("missing")
+		? "missing-pool"
+		: issue.includes("disabled")
+			? "disabled-pool"
+			: "unavailable-model";
+	return {
+		type: "chain-entry",
+		poolName: entry.pool,
+		reason,
+		detail: `${entry.pool} -> ${entry.model} skipped (${issue})`,
+		chainName: chain.name,
+		chainIndex,
+	};
+}
+
+function formatChainEntryStatus(
+	entry: ChainEntryConfig,
+	config?: MultiPassConfig,
+	authStorage?: { hasAuth(provider: string): boolean },
+	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+): string {
+	const entryState = entry.enabled ? "enabled" : "disabled";
+	const issue = config ? getChainEntryIssue(entry, config) : null;
+	let healthSuffix = "";
+	if (config && authStorage && poolManager) {
+		const pool = config.pools.find((candidate) => candidate.name === entry.pool);
+		if (pool) {
+			const summary = summarizePoolHealth(pool, authStorage, poolManager);
+			healthSuffix = ` | pool ${pool.enabled ? "enabled" : "disabled"} | ${summary.availableCount}/${summary.memberCount} available | ${summary.authedCount} authed`;
+		}
+	}
+	const issueSuffix = issue ? ` | ${issue} | skipped` : "";
+	return `${entry.pool} -> ${entry.model} (${entryState}${healthSuffix}${issueSuffix})`;
+}
+
+function formatChainListLine(
+	chain: ChainConfig,
+	config?: MultiPassConfig,
+	authStorage?: { hasAuth(provider: string): boolean },
+	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+): string {
+	const entryLabel = chain.entries.length === 1 ? "entry" : "entries";
+	const invalidEntries = config
+		? chain.entries.filter((entry) => getChainEntryIssue(entry, config)).length
+		: 0;
+	let usableEntries = 0;
+	if (config && authStorage && poolManager) {
+		usableEntries = chain.entries.filter((entry) => {
+			if (!entry.enabled) return false;
+			if (getChainEntryIssue(entry, config)) return false;
+			const pool = config.pools.find((candidate) => candidate.name === entry.pool);
+			if (!pool || !pool.enabled) return false;
+			return summarizePoolHealth(pool, authStorage, poolManager).availableCount > 0;
+		}).length;
+	}
+	const issueLabel = invalidEntries > 0 ? ` | ${invalidEntries} invalid` : "";
+	const usableLabel = config && authStorage && poolManager
+		? ` | ${usableEntries}/${chain.entries.length} usable now`
+		: "";
+	return `${chain.name} | ${chain.entries.length} ${entryLabel} | ${chain.enabled ? "enabled" : "disabled"}${issueLabel}${usableLabel}`;
+}
+
+function formatChainToggleOption(chain: ChainConfig): string {
+	return `${chain.name} -- currently ${chain.enabled ? "enabled" : "disabled"}`;
+}
+
+function formatChainRemoveOption(chain: ChainConfig): string {
+	const entryLabel = chain.entries.length === 1 ? "entry" : "entries";
+	return `${chain.name} (${chain.entries.length} ${entryLabel})`;
+}
+
+function formatChainStatusLines(
+	chain: ChainConfig,
+	config?: MultiPassConfig,
+	authStorage?: { hasAuth(provider: string): boolean },
+	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+): string[] {
+	const invalidEntries = config
+		? chain.entries.filter((entry) => getChainEntryIssue(entry, config)).length
+		: 0;
+	const usableEntries = config && authStorage && poolManager
+		? chain.entries.filter((entry) => {
+			if (!entry.enabled) return false;
+			if (getChainEntryIssue(entry, config)) return false;
+			const pool = config.pools.find((candidate) => candidate.name === entry.pool);
+			if (!pool || !pool.enabled) return false;
+			return summarizePoolHealth(pool, authStorage, poolManager).availableCount > 0;
+		}).length
+		: undefined;
+	const lines = [
+		`=== ${chain.name} (${chain.enabled ? "enabled" : "disabled"}) ===`,
+		`entries: ${chain.entries.length}`,
+		`chain state: ${chain.enabled ? "active" : "disabled (all entries skipped)"}`,
+	];
+
+	if (usableEntries !== undefined) {
+		lines.push(`usable entries now: ${usableEntries}/${chain.entries.length}`);
+	}
+
+	if (invalidEntries > 0) {
+		lines.push(`invalid entries: ${invalidEntries} (skipped until fixed)`);
+	}
+
+	if (chain.entries.length === 0) {
+		lines.push("  [no entries configured]");
+		return lines;
+	}
+
+	for (let i = 0; i < chain.entries.length; i++) {
+		const entry = chain.entries[i];
+		lines.push(`  ${i + 1}. ${formatChainEntryStatus(entry, config, authStorage, poolManager)}`);
+	}
+
+	return lines;
+}
+
+async function handlePoolChainCreate(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const config = loadGlobalConfig();
+	const chainName = await ctx.ui.input("Chain name", "e.g. primary-fallback");
+	if (!chainName?.trim()) return;
+	if (findChainByName(config.chains, chainName.trim())) {
+		ctx.ui.notify(`Chain "${chainName.trim()}" already exists.`, "warning");
+		return;
+	}
+
+	const entries: ChainEntryConfig[] = [];
+	let selecting = true;
+	while (selecting) {
+		const latestConfig = loadGlobalConfig();
+		const availablePools = latestConfig.pools;
+		const options = [
+			`--- Selected (${entries.length}): ${entries.map((entry) => formatChainEntryStatus(entry, latestConfig)).join(", ") || "none"} ---`,
+			...availablePools.map((pool) => `${pool.name} -- ${pool.baseProvider} (${pool.enabled ? "enabled" : "disabled"})`),
+			"[Create pool inline]",
+			"[Done - save chain]",
+		];
+
+		const selected = await ctx.ui.select("Add chain entries ([Done] saves, Esc cancels)", options);
+		if (!selected) {
+			ctx.ui.notify(`Cancelled chain creation for "${chainName.trim()}".`, "info");
+			return;
+		}
+		if (selected.startsWith("---")) {
+			continue;
+		}
+
+		if (selected === "[Done - save chain]") {
+			if (entries.length === 0) {
+				ctx.ui.notify(`Chain "${chainName.trim()}" needs at least 1 entry.`, "warning");
+				continue;
+			}
+			selecting = false;
+			continue;
+		}
+
+		if (selected === "[Create pool inline]") {
+			await createAndPersistPool(ctx, poolManager, {
+				allowOverwrite: false,
+				resumeChainName: chainName.trim(),
+			});
+			continue;
+		}
+
+		const poolName = selected.split(" -- ")[0];
+		const pool = availablePools.find((candidate) => candidate.name === poolName);
+		if (!pool) {
+			ctx.ui.notify(`Pool "${poolName}" is no longer available.`, "warning");
+			continue;
+		}
+
+		const selectableModels = getSelectableModelsForPool(pool);
+		if (selectableModels.length === 0) {
+			ctx.ui.notify(
+				`Pool "${pool.name}" has no selectable models for ${pool.baseProvider}.`,
+				"warning",
+			);
+			continue;
+		}
+
+		const selectedModel = await ctx.ui.select(
+			`Default model for ${pool.name}`,
+			selectableModels,
+		);
+		if (!selectedModel) continue;
+
+		const enabled = await ctx.ui.confirm(
+			`Enable entry for ${pool.name}?`,
+			`${pool.name} -> ${selectedModel}\n\nEnable this chain entry?`,
+		);
+		entries.push({ pool: pool.name, model: selectedModel, enabled });
+	}
+
+	const latestConfig = loadGlobalConfig();
+	const built = buildChainConfig(latestConfig, {
+		name: chainName.trim(),
+		entries,
+		enabled: true,
+	});
+	if (!built.ok) {
+		ctx.ui.notify(built.error, "warning");
+		return;
+	}
+
+	latestConfig.chains.push(built.chain);
+	saveGlobalConfig(latestConfig);
+	ctx.ui.notify(
+		`Created chain "${built.chain.name}" with ${built.chain.entries.length} ${built.chain.entries.length === 1 ? "entry" : "entries"}.`,
+		"info",
+	);
+}
+
+async function handlePoolChainList(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.chains.length === 0) {
+		ctx.ui.notify("No chains configured. Use /pool chain to create one.", "info");
+		return;
+	}
+
+	await ctx.ui.select(
+		"Chains",
+		config.chains.map((chain) =>
+			formatChainListLine(chain, config, ctx.modelRegistry.authStorage, poolManager),
+		),
+	);
+}
+
+async function handlePoolChainToggle(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.chains.length === 0) {
+		ctx.ui.notify("No chains configured.", "info");
+		return;
+	}
+
+	const options = config.chains.map(formatChainToggleOption);
+	const selected = await ctx.ui.select("Toggle chain", options);
+	if (!selected) return;
+
+	const idx = options.indexOf(selected);
+	if (idx < 0) return;
+
+	config.chains[idx].enabled = !config.chains[idx].enabled;
+	saveGlobalConfig(config);
+
+	const chain = config.chains[idx];
+	ctx.ui.notify(
+		`Chain "${chain.name}" is now ${chain.enabled ? "enabled" : "disabled"}`,
+		"info",
+	);
+}
+
+async function handlePoolChainRemove(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.chains.length === 0) {
+		ctx.ui.notify("No chains configured.", "info");
+		return;
+	}
+
+	const options = config.chains.map(formatChainRemoveOption);
+	const selected = await ctx.ui.select("Remove chain", options);
+	if (!selected) return;
+
+	const idx = options.indexOf(selected);
+	if (idx < 0) return;
+
+	const chain = config.chains[idx];
+	const confirmed = await ctx.ui.confirm(
+		"Confirm removal",
+		`Remove chain "${chain.name}"?`,
+	);
+	if (!confirmed) return;
+
+	config.chains.splice(idx, 1);
+	saveGlobalConfig(config);
+	ctx.ui.notify(`Removed chain "${chain.name}"`, "info");
+}
+
+async function handlePoolChainStatus(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.chains.length === 0) {
+		ctx.ui.notify("No chains configured.", "info");
+		return;
+	}
+
+	const selected = await ctx.ui.select(
+		"Chain Status",
+		config.chains.map((chain) => `${chain.name} -- inspect chain entries`),
+	);
+	if (!selected) return;
+
+	const chainName = selected.split(" -- ")[0];
+	const chain = findChainByName(config.chains, chainName);
+	if (!chain) {
+		ctx.ui.notify(`Chain "${chainName}" not found.`, "warning");
+		return;
+	}
+
+	await ctx.ui.select(
+		`Chain Status: ${chain.name}`,
+		formatChainStatusLines(chain, config, ctx.modelRegistry.authStorage, poolManager),
+	);
+}
+
+async function handlePoolChainMenu(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const actions = [
+		"create   -- Create a new fallback chain",
+		"list     -- Show all chains",
+		"toggle   -- Enable/disable a chain",
+		"remove   -- Remove a chain",
+		"status   -- Inspect ordered chain entries",
+	];
+
+	const selected = await ctx.ui.select("Chain Manager", actions);
+	if (!selected) return;
+
+	const action = selected.split(" ")[0].trim();
+	switch (action) {
+		case "create":
+			return handlePoolChainCreate(ctx, poolManager);
+		case "list":
+			return handlePoolChainList(ctx, poolManager);
+		case "toggle":
+			return handlePoolChainToggle(ctx);
+		case "remove":
+			return handlePoolChainRemove(ctx);
+		case "status":
+			return handlePoolChainStatus(ctx, poolManager);
+	}
 }
 
 async function handlePoolProject(
@@ -1388,6 +2394,7 @@ async function handlePoolMenu(
 	const actions = [
 		"create   -- Create a new rotation pool",
 		"list     -- Show all pools",
+		"chain    -- Manage saved fallback chains",
 		"toggle   -- Enable/disable a pool",
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
@@ -1403,6 +2410,8 @@ async function handlePoolMenu(
 			return handlePoolCreate(ctx, poolManager);
 		case "list":
 			return handlePoolList(ctx, poolManager);
+		case "chain":
+			return handlePoolChainMenu(ctx, poolManager);
 		case "toggle":
 			return handlePoolToggle(ctx, poolManager);
 		case "remove":
@@ -1476,6 +2485,19 @@ export default function multiSub(pi: ExtensionAPI) {
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
+		const enabledChains = effective.chains.filter((chain) => chain.enabled);
+		const activeChain = enabledChains[0];
+		if (activeChain) {
+			const firstEnabledEntry = activeChain.entries.find((entry) => entry.enabled);
+			if (firstEnabledEntry) {
+				ctx.ui.setStatus(
+					"multi-pass",
+					`chain:${activeChain.name} | starts ${firstEnabledEntry.pool} -> ${firstEnabledEntry.model}`,
+				);
+				return;
+			}
+		}
+
 		const projectConf = loadProjectConfig(ctx.cwd);
 		if (projectConf) {
 			const poolCount = effective.pools.filter((p) => p.enabled).length;
@@ -1493,9 +2515,9 @@ export default function multiSub(pi: ExtensionAPI) {
 	let lastUserPrompt: string | null = null;
 
 	// Listen for user input to track last prompt
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		lastUserPrompt = event.prompt;
-		poolManager.clearRetryFlag();
+		poolManager.startTurn(event.prompt, ctx.model);
 	});
 
 	// Listen for errors to trigger pool rotation
@@ -1509,15 +2531,20 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (assistantMsg.stopReason !== "error") return;
 		if (!assistantMsg.errorMessage) return;
 
+		const effective = loadEffectiveConfig(ctx.cwd);
 		const rotated = await poolManager.handleError(
 			assistantMsg.errorMessage,
 			ctx.model,
 			ctx,
 			lastUserPrompt,
+			normalizeMultiPassConfig({
+				subscriptions: effective.subscriptions,
+				pools: effective.pools,
+				chains: effective.chains,
+			}),
 		);
 
 		if (!rotated && isRateLimitError(assistantMsg.errorMessage)) {
-			// Show which pool members are available
 			const pool = ctx.model
 				? poolManager.getPoolForProvider(ctx.model.provider)
 				: undefined;
@@ -1577,14 +2604,20 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("pool", {
 		description: "Manage subscription rotation pools",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["create", "list", "toggle", "remove", "status", "project"];
+			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "project"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
 				: null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const subcommand = args.trim().toLowerCase();
+			const parts = args
+				.trim()
+				.toLowerCase()
+				.split(/\s+/)
+				.filter(Boolean);
+			const subcommand = parts[0] || "";
+			const chainSubcommand = parts[1] || "";
 			switch (subcommand) {
 				case "create":
 				case "new":
@@ -1592,6 +2625,28 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "list":
 				case "ls":
 					return handlePoolList(ctx, poolManager);
+				case "chain":
+					switch (chainSubcommand) {
+						case "":
+							return handlePoolChainMenu(ctx, poolManager);
+						case "list":
+						case "ls":
+							return handlePoolChainList(ctx);
+						case "toggle":
+							return handlePoolChainToggle(ctx);
+						case "remove":
+						case "rm":
+						case "delete":
+							return handlePoolChainRemove(ctx);
+						case "status":
+						case "info":
+							return handlePoolChainStatus(ctx);
+						case "create":
+						case "new":
+							return handlePoolChainCreate(ctx, poolManager);
+						default:
+							return handlePoolChainMenu(ctx, poolManager);
+					}
 				case "toggle":
 					return handlePoolToggle(ctx, poolManager);
 				case "remove":
