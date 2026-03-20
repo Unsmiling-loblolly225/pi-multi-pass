@@ -40,7 +40,12 @@ import type {
 	ExtensionContext,
 	AgentEndEvent,
 } from "@mariozechner/pi-coding-agent";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import {
+	BorderedLoader,
+	DynamicBorder,
+	getAgentDir,
+	keyHint,
+} from "@mariozechner/pi-coding-agent";
 import {
 	anthropicOAuthProvider,
 	loginAnthropic,
@@ -64,6 +69,14 @@ import {
 	type OAuthProviderInterface,
 } from "@mariozechner/pi-ai/oauth";
 import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
+import {
+	Container,
+	Key,
+	SelectList,
+	Text,
+	matchesKey,
+	type SelectItem,
+} from "@mariozechner/pi-tui";
 
 // ==========================================================================
 // Provider templates
@@ -227,6 +240,1161 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
+
+// ==========================================================================
+// Built-in quota checking
+// ==========================================================================
+
+const DEFAULT_CODEX_USAGE_BASE_URL = "https://chatgpt.com/backend-api";
+const GOOGLE_GEMINI_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS = [
+	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+	"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+] as const;
+const GOOGLE_GEMINI_HEADERS = {
+	"User-Agent": "google-api-nodejs-client/9.15.1",
+	"X-Goog-Api-Client": "gl-node/22.17.0",
+};
+const GOOGLE_ANTIGRAVITY_HEADERS = {
+	"User-Agent": "antigravity/1.11.9 windows/amd64",
+	"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+	"Client-Metadata": JSON.stringify({
+		ideType: "IDE_UNSPECIFIED",
+		platform: "PLATFORM_UNSPECIFIED",
+		pluginType: "GEMINI",
+	}),
+};
+const GOOGLE_ANTIGRAVITY_HIDDEN_MODELS = new Set(["tab_flash_lite_preview"]);
+const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
+const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
+
+type QuotaStatusKind = "ready" | "watch" | "low" | "blocked" | "error" | "missing-auth";
+
+interface AuthStorageEntry {
+	type?: string;
+	access?: string;
+	refresh?: string;
+	expires?: number;
+	accountId?: string;
+	projectId?: string;
+	[key: string]: unknown;
+}
+
+interface QuotaAccount {
+	providerName: string;
+	baseProvider: string;
+	displayName: string;
+	auth?: AuthStorageEntry;
+}
+
+interface QuotaCheckResult {
+	account: QuotaAccount;
+	kind: QuotaStatusKind;
+	summary: string;
+	details: string[];
+	score: number;
+}
+
+interface ProviderQuotaChecker {
+	baseProvider: string;
+	check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult>;
+}
+
+interface CodexUsageWindow {
+	usedPercent: number;
+	windowSeconds: number;
+	resetAt?: number;
+}
+
+interface CodexUsageSnapshot {
+	planType: string;
+	email: string;
+	fiveHour?: CodexUsageWindow;
+	weekly?: CodexUsageWindow;
+}
+
+interface GoogleGeminiQuotaResponse {
+	buckets?: Array<{
+		modelId?: string;
+		remainingFraction?: number;
+		resetTime?: string;
+	}>;
+}
+
+interface GoogleAntigravityQuotaResponse {
+	models?: Record<
+		string,
+		{
+			displayName?: string;
+			model?: string;
+			isInternal?: boolean;
+			quotaInfo?: {
+				remainingFraction?: number;
+				resetTime?: string;
+			};
+		}
+	>;
+}
+
+interface GoogleQuotaModelSnapshot {
+	model: string;
+	remainingPercent?: number;
+	resetAt?: number;
+}
+
+interface GoogleQuotaAccountSnapshot {
+	endpoint: string;
+	projectId?: string;
+	models: GoogleQuotaModelSnapshot[];
+	worstRemainingPercent?: number;
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> {
+	const parts = token.split(".");
+	if (parts.length < 2) return {};
+	try {
+		return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
+	} catch {
+		return {};
+	}
+}
+
+function getRecord(value: unknown): Record<string, unknown> | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	return value as Record<string, unknown>;
+}
+
+function getCodexTokenMetadata(accessToken: string): {
+	accountId?: string;
+	planType?: string;
+	email?: string;
+} {
+	const payload = decodeJwtPayload(accessToken);
+	const auth = getRecord(payload[OPENAI_AUTH_CLAIM]);
+	const profile = getRecord(payload[OPENAI_PROFILE_CLAIM]);
+	const accountId = typeof auth?.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined;
+	const planType = typeof auth?.chatgpt_plan_type === "string" ? auth.chatgpt_plan_type : undefined;
+	const email = typeof profile?.email === "string" ? profile.email : undefined;
+	return { accountId, planType, email };
+}
+
+function normalizeCodexUsageWindow(window: unknown): CodexUsageWindow | undefined {
+	const raw = getRecord(window);
+	if (!raw) return undefined;
+	const usedPercent = typeof raw.used_percent === "number" ? raw.used_percent : 0;
+	const windowSeconds = typeof raw.limit_window_seconds === "number" ? raw.limit_window_seconds : 0;
+	const resetAt = typeof raw.reset_at === "number" ? raw.reset_at : undefined;
+	return {
+		usedPercent,
+		windowSeconds,
+		resetAt,
+	};
+}
+
+function matchesUsageWindow(window: CodexUsageWindow | undefined, expectedSeconds: number): boolean {
+	if (!window) return false;
+	return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
+}
+
+function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
+	const raw = getRecord(data);
+	const rateLimit = getRecord(raw?.rate_limit);
+	const windows = [
+		normalizeCodexUsageWindow(rateLimit?.primary_window),
+		normalizeCodexUsageWindow(rateLimit?.secondary_window),
+	].filter((window): window is CodexUsageWindow => Boolean(window));
+	const fiveHour = windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60));
+	const weekly = windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60));
+	return {
+		planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
+		email: typeof raw?.email === "string" ? raw.email : "",
+		fiveHour,
+		weekly,
+	};
+}
+
+function getCodexWindowRemaining(window: CodexUsageWindow | undefined): number | undefined {
+	if (!window) return undefined;
+	return Math.max(0, Math.min(100, 100 - window.usedPercent));
+}
+
+function formatResetShort(resetAt?: number): string {
+	if (!resetAt) return "--";
+	const diffMs = resetAt * 1000 - Date.now();
+	if (diffMs <= 0) return "now";
+	const totalMinutes = Math.round(diffMs / 60000);
+	const days = Math.floor(totalMinutes / (60 * 24));
+	const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+	const minutes = totalMinutes % 60;
+	if (days > 0) return `~${days}d`;
+	if (hours > 0) return `~${hours}h`;
+	return `~${minutes}m`;
+}
+
+function formatResetLong(resetAt?: number): string {
+	if (!resetAt) return "unknown";
+	const diffMs = resetAt * 1000 - Date.now();
+	if (diffMs <= 0) return "now";
+	const totalMinutes = Math.round(diffMs / 60000);
+	const days = Math.floor(totalMinutes / (60 * 24));
+	const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+	const minutes = totalMinutes % 60;
+	if (days > 0) return `in ${days}d ${hours}h`;
+	if (hours > 0) return `in ${hours}h ${minutes}m`;
+	return `in ${minutes}m`;
+}
+
+function formatRemainingPercent(value: number | undefined): string {
+	if (value === undefined) return "--";
+	return `${Math.round(value)}%`;
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof Error && error.name === "AbortError";
+}
+
+function parseIsoTimestampSeconds(value: string | undefined): number | undefined {
+	if (!value) return undefined;
+	const parsed = Date.parse(value);
+	if (!Number.isFinite(parsed)) return undefined;
+	return Math.floor(parsed / 1000);
+}
+
+async function readResponseError(response: Response): Promise<string> {
+	const raw = await response.text();
+	if (response.status === 401) {
+		return "Unauthorized - log in again";
+	}
+	if (!raw) {
+		return `HTTP ${response.status}`;
+	}
+	try {
+		const parsed = JSON.parse(raw) as {
+			error?: { message?: string };
+			message?: string;
+		};
+		const message = parsed.error?.message || parsed.message;
+		if (message) return `HTTP ${response.status}: ${message}`;
+	} catch {
+		// ignore JSON parse errors and fall back to raw text
+	}
+	return `HTTP ${response.status}: ${raw}`;
+}
+
+function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
+	kind: QuotaStatusKind;
+	score: number;
+} {
+	const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
+	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
+	if (values.length === 0) {
+		return { kind: "error", score: 0 };
+	}
+	const bottleneck = Math.min(...values);
+	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
+	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
+	return { kind: "ready", score: bottleneck };
+}
+
+function formatQuotaKind(kind: QuotaStatusKind): string {
+	switch (kind) {
+		case "ready":
+			return "ready";
+		case "watch":
+			return "watch";
+		case "low":
+			return "low";
+		case "blocked":
+			return "blocked";
+		case "missing-auth":
+			return "not logged in";
+		default:
+			return "error";
+	}
+}
+
+function compareQuotaResults(left: QuotaCheckResult, right: QuotaCheckResult): number {
+	const rank = (kind: QuotaStatusKind): number => {
+		switch (kind) {
+			case "ready":
+				return 0;
+			case "watch":
+				return 1;
+			case "low":
+				return 2;
+			case "blocked":
+				return 3;
+			case "error":
+				return 4;
+			case "missing-auth":
+				return 5;
+		}
+	};
+	return rank(left.kind) - rank(right.kind)
+		|| right.score - left.score
+		|| left.account.displayName.localeCompare(right.account.displayName);
+}
+
+function getQuotaStatusGlyph(kind: QuotaStatusKind): string {
+	switch (kind) {
+		case "ready":
+			return "✓";
+		case "watch":
+			return "◔";
+		case "low":
+			return "!";
+		case "blocked":
+			return "✕";
+		case "missing-auth":
+			return "○";
+		default:
+			return "?";
+	}
+}
+
+function formatQuotaOverview(results: QuotaCheckResult[]): string {
+	const counts = {
+		ready: 0,
+		watch: 0,
+		low: 0,
+		blocked: 0,
+		error: 0,
+		missingAuth: 0,
+	};
+
+	for (const result of results) {
+		switch (result.kind) {
+			case "ready":
+				counts.ready++;
+				break;
+			case "watch":
+				counts.watch++;
+				break;
+			case "low":
+				counts.low++;
+				break;
+			case "blocked":
+				counts.blocked++;
+				break;
+			case "missing-auth":
+				counts.missingAuth++;
+				break;
+			default:
+				counts.error++;
+		}
+	}
+
+	const parts = [`${results.length} ${results.length === 1 ? "account" : "accounts"}`];
+	if (counts.ready > 0) parts.push(`${counts.ready} ready`);
+	if (counts.watch > 0) parts.push(`${counts.watch} watch`);
+	if (counts.low > 0) parts.push(`${counts.low} low`);
+	if (counts.blocked > 0) parts.push(`${counts.blocked} blocked`);
+	if (counts.error > 0) parts.push(`${counts.error} error`);
+	if (counts.missingAuth > 0) parts.push(`${counts.missingAuth} not logged in`);
+
+	const best = results[0];
+	if (best) {
+		parts.push(`best now: ${best.account.displayName}`);
+	}
+
+	return parts.join(" • ");
+}
+
+function formatQuotaCurrentHint(
+	results: QuotaCheckResult[],
+	currentProviderName: string | undefined,
+): string | undefined {
+	if (!currentProviderName) return undefined;
+
+	const current = results.find((result) => result.account.providerName === currentProviderName);
+	if (!current) return undefined;
+
+	let hint = `Current: ${current.account.displayName} is ${formatQuotaKind(current.kind)}`;
+	const best = results[0];
+	if (best && best.account.providerName !== current.account.providerName) {
+		hint += ` • best available: ${best.account.displayName}`;
+	}
+	if (current.kind !== "ready") {
+		hint += " • snapshot only: auto-switch happens after a runtime rate-limit error";
+	}
+	return hint;
+}
+
+function buildQuotaSelectItems(
+	results: QuotaCheckResult[],
+	currentProviderName: string | undefined,
+): SelectItem[] {
+	const bestProviderName = results[0]?.account.providerName;
+	return results.map((result) => {
+		const badges: string[] = [];
+		if (result.account.providerName === currentProviderName) badges.push("current");
+		if (result.account.providerName === bestProviderName) badges.push("best now");
+		const badgeSuffix = badges.length > 0 ? ` • ${badges.join(" • ")}` : "";
+
+		return {
+			value: result.account.providerName,
+			label: `${getQuotaStatusGlyph(result.kind)} ${result.account.displayName}`,
+			description: `${result.summary}${badgeSuffix}`,
+		};
+	});
+}
+
+function getWrappedSelectIndex(items: SelectItem[], value: string | undefined): number {
+	if (!value) return 0;
+	const index = items.findIndex((item) => item.value === value);
+	return index >= 0 ? index : 0;
+}
+
+async function showWrappedSelect(
+	ctx: ExtensionCommandContext,
+	options: {
+		title: string;
+		items: SelectItem[];
+		subtitle?: string;
+		initialValue?: string;
+		confirmHint?: string;
+		cancelHint?: string;
+	},
+): Promise<string | undefined> {
+	if (options.items.length === 0) return undefined;
+
+	if (!ctx.hasUI) {
+		const renderedItems = options.items.map((item) =>
+			item.description ? `${item.label} — ${item.description}` : item.label,
+		);
+		const selected = await ctx.ui.select(options.title, renderedItems);
+		if (!selected) return undefined;
+		const index = renderedItems.indexOf(selected);
+		return index >= 0 ? options.items[index]?.value : undefined;
+	}
+
+	const confirmHint = options.confirmHint || "select";
+	const cancelHint = options.cancelHint || "close";
+
+	const selectedValue = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		const container = new Container();
+		const footer = [
+			keyHint("tui.select.confirm", confirmHint),
+			keyHint("tui.select.cancel", cancelHint),
+		].join(" • ");
+
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+		container.addChild(new Text(theme.fg("accent", theme.bold(options.title))));
+		if (options.subtitle) {
+			container.addChild(new Text(theme.fg("dim", options.subtitle)));
+		}
+
+		const selectList = new SelectList(options.items, Math.min(options.items.length, 10), {
+			selectedPrefix: (text) => theme.fg("accent", text),
+			selectedText: (text) => theme.fg("accent", text),
+			description: (text) => theme.fg("muted", text),
+			scrollInfo: (text) => theme.fg("dim", text),
+			noMatch: (text) => theme.fg("warning", text),
+		});
+		selectList.setSelectedIndex(getWrappedSelectIndex(options.items, options.initialValue));
+		selectList.onSelect = (item) => done(item.value);
+		selectList.onCancel = () => done(null);
+		container.addChild(selectList);
+		container.addChild(new Text(theme.fg("dim", footer)));
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+		return {
+			render(width: number) {
+				return container.render(width);
+			},
+			invalidate() {
+				container.invalidate();
+			},
+			handleInput(data: string) {
+				const current = selectList.getSelectedItem();
+				const currentIndex = current
+					? options.items.findIndex((item) => item.value === current.value)
+					: 0;
+
+				if (matchesKey(data, Key.up) && options.items.length > 1 && currentIndex === 0) {
+					selectList.setSelectedIndex(options.items.length - 1);
+					tui.requestRender();
+					return;
+				}
+
+				if (
+					matchesKey(data, Key.down)
+					&& options.items.length > 1
+					&& currentIndex === options.items.length - 1
+				) {
+					selectList.setSelectedIndex(0);
+					tui.requestRender();
+					return;
+				}
+
+				selectList.handleInput(data);
+				tui.requestRender();
+			},
+		};
+	});
+
+	return selectedValue ?? undefined;
+}
+
+async function runQuotaChecks(
+	accounts: QuotaAccount[],
+	signal?: AbortSignal,
+): Promise<QuotaCheckResult[]> {
+	const results = await Promise.all(accounts.map(async (account) => {
+		const checker = PROVIDER_QUOTA_CHECKERS.find(
+			(candidate) => candidate.baseProvider === account.baseProvider,
+		);
+		if (!checker) return undefined;
+		return checker.check(account, signal);
+	}));
+
+	return results
+		.filter((result): result is QuotaCheckResult => Boolean(result))
+		.sort(compareQuotaResults);
+}
+
+async function loadQuotaResults(
+	ctx: ExtensionCommandContext,
+	accounts: QuotaAccount[],
+): Promise<QuotaCheckResult[] | null> {
+	if (!ctx.hasUI) {
+		return runQuotaChecks(accounts);
+	}
+
+	return ctx.ui.custom<QuotaCheckResult[] | null>((tui, theme, _kb, done) => {
+		const loader = new BorderedLoader(
+			tui,
+			theme,
+			`Checking limits across ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}...`,
+		);
+		loader.onAbort = () => done(null);
+
+		runQuotaChecks(accounts, loader.signal)
+			.then(done)
+			.catch((error) => {
+				if (loader.signal.aborted) {
+					done(null);
+					return;
+				}
+				console.error("Failed to load quota checks", error);
+				done(null);
+			});
+
+		return loader;
+	});
+}
+
+async function selectQuotaResult(
+	ctx: ExtensionCommandContext,
+	results: QuotaCheckResult[],
+	preferredProviderName?: string,
+): Promise<QuotaCheckResult | undefined> {
+	const currentProviderName = preferredProviderName || ctx.model?.provider;
+	const selectedProviderName = await showWrappedSelect(ctx, {
+		title: "Subscription Limits",
+		subtitle: [
+			"Select an account to inspect its full quota windows.",
+			formatQuotaOverview(results),
+			formatQuotaCurrentHint(results, currentProviderName),
+		].filter(Boolean).join("\n"),
+		items: buildQuotaSelectItems(results, currentProviderName),
+		initialValue: currentProviderName,
+		confirmHint: "inspect",
+		cancelHint: "close",
+	});
+	if (!selectedProviderName) return undefined;
+	return results.find((result) => result.account.providerName === selectedProviderName);
+}
+
+function normalizeGoogleRemainingPercent(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return Math.max(0, Math.min(100, Math.round(value * 100)));
+}
+
+function getGoogleProjectId(account: QuotaAccount, auth: AuthStorageEntry): string | undefined {
+	if (typeof auth.projectId === "string" && auth.projectId.length > 0) {
+		return auth.projectId;
+	}
+
+	if (account.baseProvider === "google-antigravity") {
+		const projectId = process.env.GOOGLE_ANTIGRAVITY_PROJECT_ID || process.env.GOOGLE_ANTIGRAVITY_PROJECT;
+		if (projectId) return projectId;
+	}
+
+	const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
+	return projectId || undefined;
+}
+
+function updateGoogleQuotaModel(
+	modelsByName: Map<string, GoogleQuotaModelSnapshot>,
+	model: string,
+	remainingPercent: number | undefined,
+	resetAt: number | undefined,
+): void {
+	const existing = modelsByName.get(model);
+	if (!existing) {
+		modelsByName.set(model, { model, remainingPercent, resetAt });
+		return;
+	}
+
+	let next = existing;
+	if (remainingPercent !== undefined) {
+		if (existing.remainingPercent === undefined || remainingPercent < existing.remainingPercent) {
+			next = { ...next, remainingPercent };
+		}
+	}
+	if (resetAt !== undefined) {
+		if (next.resetAt === undefined || resetAt < next.resetAt) {
+			next = { ...next, resetAt };
+		}
+	}
+	if (next !== existing) {
+		modelsByName.set(model, next);
+	}
+}
+
+function buildGoogleQuotaSnapshot(
+	endpoint: string,
+	projectId: string | undefined,
+	modelsByName: Map<string, GoogleQuotaModelSnapshot>,
+): GoogleQuotaAccountSnapshot {
+	const models = [...modelsByName.values()];
+	const remainingPercents = models
+		.map((model) => model.remainingPercent)
+		.filter((value): value is number => value !== undefined);
+	const worstRemainingPercent = remainingPercents.length > 0
+		? Math.min(...remainingPercents)
+		: undefined;
+
+	return {
+		endpoint,
+		projectId,
+		models,
+		worstRemainingPercent,
+	};
+}
+
+function getGoogleGeminiModelLabel(modelId: string | undefined): string {
+	if (!modelId) return "unknown";
+	const normalized = modelId.toLowerCase();
+	if (normalized.includes("pro")) return "Pro";
+	if (normalized.includes("flash")) return "Flash";
+	return modelId;
+}
+
+function parseGoogleGeminiQuotaSnapshot(
+	data: unknown,
+	projectId: string | undefined,
+): GoogleQuotaAccountSnapshot {
+	const raw = getRecord(data) as GoogleGeminiQuotaResponse | undefined;
+	const buckets = Array.isArray(raw?.buckets) ? raw.buckets : [];
+	const modelsByName = new Map<string, GoogleQuotaModelSnapshot>();
+
+	for (const bucketValue of buckets) {
+		const bucket = getRecord(bucketValue);
+		const model = getGoogleGeminiModelLabel(
+			typeof bucket?.modelId === "string" ? bucket.modelId : undefined,
+		);
+		const remainingPercent = normalizeGoogleRemainingPercent(bucket?.remainingFraction);
+		const resetAt = typeof bucket?.resetTime === "string"
+			? parseIsoTimestampSeconds(bucket.resetTime)
+			: undefined;
+		if (remainingPercent === undefined && resetAt === undefined) continue;
+		updateGoogleQuotaModel(modelsByName, model, remainingPercent, resetAt);
+	}
+
+	return buildGoogleQuotaSnapshot(GOOGLE_GEMINI_QUOTA_ENDPOINT, projectId, modelsByName);
+}
+
+function parseGoogleAntigravityQuotaSnapshot(
+	data: unknown,
+	endpoint: string,
+	projectId: string | undefined,
+): GoogleQuotaAccountSnapshot {
+	const raw = getRecord(data) as GoogleAntigravityQuotaResponse | undefined;
+	const rawModels = getRecord(raw?.models);
+	const modelsByName = new Map<string, GoogleQuotaModelSnapshot>();
+
+	if (rawModels) {
+		for (const [modelKey, modelValue] of Object.entries(rawModels)) {
+			const model = getRecord(modelValue);
+			if (model?.isInternal === true) continue;
+			if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(modelKey.toLowerCase())) continue;
+			const displayName = typeof model?.displayName === "string" && model.displayName.length > 0
+				? model.displayName
+				: typeof model?.model === "string" && model.model.length > 0
+					? model.model
+					: modelKey;
+			if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(displayName.toLowerCase())) continue;
+			const quotaInfo = getRecord(model?.quotaInfo);
+			const remainingPercent = normalizeGoogleRemainingPercent(quotaInfo?.remainingFraction);
+			const resetAt = typeof quotaInfo?.resetTime === "string"
+				? parseIsoTimestampSeconds(quotaInfo.resetTime)
+				: undefined;
+			if (remainingPercent === undefined && resetAt === undefined) continue;
+			updateGoogleQuotaModel(modelsByName, displayName, remainingPercent, resetAt);
+		}
+	}
+
+	return buildGoogleQuotaSnapshot(endpoint, projectId, modelsByName);
+}
+
+function classifyGoogleQuotaKind(snapshot: GoogleQuotaAccountSnapshot): {
+	kind: QuotaStatusKind;
+	score: number;
+} {
+	const bottleneck = snapshot.worstRemainingPercent;
+	if (bottleneck === undefined) {
+		return { kind: "error", score: 0 };
+	}
+	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
+	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
+	return { kind: "ready", score: bottleneck };
+}
+
+async function resolveGoogleQuotaAccess(
+	account: QuotaAccount,
+	auth: AuthStorageEntry,
+): Promise<{ accessToken: string; projectId?: string }> {
+	const projectId = getGoogleProjectId(account, auth);
+	const hasFreshAccess = typeof auth.access === "string"
+		&& auth.access.length > 0
+		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
+	if (hasFreshAccess) {
+		return { accessToken: auth.access, projectId };
+	}
+
+	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
+		const credentials = account.baseProvider === "google-gemini-cli"
+			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
+			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
+		return {
+			accessToken: credentials.access,
+			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
+				? credentials.projectId
+				: projectId,
+		};
+	}
+
+	if (typeof auth.access === "string" && auth.access.length > 0) {
+		return { accessToken: auth.access, projectId };
+	}
+
+	throw new Error("Missing Google access token. Log in again.");
+}
+
+async function fetchGoogleGeminiQuotaSnapshot(
+	accessToken: string,
+	projectId: string | undefined,
+	signal?: AbortSignal,
+): Promise<GoogleQuotaAccountSnapshot> {
+	const response = await fetch(GOOGLE_GEMINI_QUOTA_ENDPOINT, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${accessToken}`,
+			Accept: "application/json",
+			"Content-Type": "application/json",
+			...GOOGLE_GEMINI_HEADERS,
+		},
+		body: "{}",
+		signal,
+	});
+	if (!response.ok) {
+		throw new Error(await readResponseError(response));
+	}
+	return parseGoogleGeminiQuotaSnapshot(await response.json(), projectId);
+}
+
+async function fetchGoogleAntigravityQuotaSnapshot(
+	accessToken: string,
+	projectId: string | undefined,
+	signal?: AbortSignal,
+): Promise<GoogleQuotaAccountSnapshot> {
+	let lastError = "Google quota lookup failed";
+
+	for (const endpoint of GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS) {
+		const response = await fetch(endpoint, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${accessToken}`,
+				Accept: "application/json",
+				"Content-Type": "application/json",
+				...GOOGLE_ANTIGRAVITY_HEADERS,
+			},
+			body: JSON.stringify(projectId ? { project: projectId } : {}),
+			signal,
+		});
+		if (response.ok) {
+			return parseGoogleAntigravityQuotaSnapshot(await response.json(), endpoint, projectId);
+		}
+		lastError = await readResponseError(response);
+	}
+
+	throw new Error(lastError);
+}
+
+function getGoogleQuotaBucketLabel(account: QuotaAccount, count: number): string {
+	if (account.baseProvider === "google-gemini-cli") {
+		return `${count} ${count === 1 ? "family" : "families"}`;
+	}
+	return `${count} ${count === 1 ? "model" : "models"}`;
+}
+
+function buildGoogleQuotaErrorDetails(
+	account: QuotaAccount,
+	message: string,
+	projectId?: string,
+): string[] {
+	const details = [
+		`account: ${account.displayName}`,
+		`provider: ${account.providerName}`,
+		"status: error",
+	];
+	if (projectId) {
+		details.push(`project: ${projectId}`);
+	}
+	details.push(`details: ${message}`);
+
+	if (/401|unauthorized/i.test(message)) {
+		details.push("login: use /subs login or /login to authenticate this account again");
+		return details;
+	}
+
+	if (/403|permission/i.test(message)) {
+		if (account.baseProvider === "google-gemini-cli") {
+			details.push(
+				"hint: Google Cloud Code Assist rejected quota access for this account; try /subs login again and verify this account still has Gemini quota access",
+			);
+		} else {
+			details.push(
+				"hint: Google rejected this Antigravity quota request; verify the saved project/account pairing is still valid and try /subs login again",
+			);
+		}
+	}
+
+	return details;
+}
+
+function formatGoogleQuotaDetails(
+	account: QuotaAccount,
+	snapshot: GoogleQuotaAccountSnapshot,
+	kind: QuotaStatusKind,
+): string[] {
+	const details = [
+		`account: ${account.displayName}`,
+		`provider: ${account.providerName}`,
+		`status: ${formatQuotaKind(kind)}`,
+	];
+	if (snapshot.projectId) {
+		details.push(`project: ${snapshot.projectId}`);
+	}
+	if (snapshot.worstRemainingPercent !== undefined) {
+		details.push(`bottleneck: ${formatRemainingPercent(snapshot.worstRemainingPercent)} left`);
+	}
+	for (const model of [...snapshot.models].sort((left, right) => {
+		const leftPercent = left.remainingPercent ?? 101;
+		const rightPercent = right.remainingPercent ?? 101;
+		return leftPercent - rightPercent || left.model.localeCompare(right.model);
+	})) {
+		details.push(
+			`${model.model}: ${formatRemainingPercent(model.remainingPercent)} left, resets ${formatResetLong(model.resetAt)}`,
+		);
+	}
+	details.push(`endpoint: ${snapshot.endpoint}`);
+	return details;
+}
+
+async function checkGoogleQuotaAccount(
+	account: QuotaAccount,
+	fetchSnapshot: (
+		accessToken: string,
+		projectId: string | undefined,
+		signal?: AbortSignal,
+	) => Promise<GoogleQuotaAccountSnapshot>,
+	signal?: AbortSignal,
+): Promise<QuotaCheckResult> {
+	const auth = account.auth;
+	if (!auth || auth.type !== "oauth") {
+		return {
+			account,
+			kind: "missing-auth",
+			summary: "not logged in",
+			details: [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				"status: not logged in",
+				"login: use /subs login or /login to authenticate this account",
+			],
+			score: 0,
+		};
+	}
+	if ((typeof auth.access !== "string" || auth.access.length === 0)
+		&& (typeof auth.refresh !== "string" || auth.refresh.length === 0)) {
+		return {
+			account,
+			kind: "missing-auth",
+			summary: "missing Google tokens",
+			details: [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				"status: not logged in",
+				"details: saved Google credentials are missing both access and refresh tokens",
+				"login: use /subs login or /login to authenticate this account again",
+			],
+			score: 0,
+		};
+	}
+
+	let projectId: string | undefined;
+
+	try {
+		const credentials = await resolveGoogleQuotaAccess(account, auth);
+		projectId = credentials.projectId;
+		const snapshot = await fetchSnapshot(credentials.accessToken, credentials.projectId, signal);
+		if (snapshot.models.length === 0 || snapshot.worstRemainingPercent === undefined) {
+			return {
+				account,
+				kind: "error",
+				summary: "no model quota data returned",
+				details: [
+					`account: ${account.displayName}`,
+					`provider: ${account.providerName}`,
+					"status: error",
+					...(projectId ? [`project: ${projectId}`] : []),
+					"details: Google returned no usable model quota data",
+					`endpoint: ${snapshot.endpoint}`,
+				],
+				score: 0,
+			};
+		}
+
+		const classification = classifyGoogleQuotaKind(snapshot);
+		return {
+			account,
+			kind: classification.kind,
+			summary: `${getGoogleQuotaBucketLabel(account, snapshot.models.length)} | bottleneck ${formatRemainingPercent(snapshot.worstRemainingPercent)} | ${formatQuotaKind(classification.kind)}`,
+			details: formatGoogleQuotaDetails(account, snapshot, classification.kind),
+			score: classification.score,
+		};
+	} catch (error: unknown) {
+		if (signal?.aborted || isAbortError(error)) throw error;
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			account,
+			kind: "error",
+			summary: message,
+			details: buildGoogleQuotaErrorDetails(account, message, projectId),
+			score: 0,
+		};
+	}
+}
+
+function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
+	const config = loadGlobalConfig();
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const seen = new Set<string>();
+	const accounts: QuotaAccount[] = [];
+	const pushAccount = (providerName: string, displayName: string) => {
+		if (seen.has(providerName)) return;
+		seen.add(providerName);
+		accounts.push({
+			providerName,
+			baseProvider: getBaseProvider(providerName) || providerName,
+			displayName,
+			auth: ctx.modelRegistry.authStorage.get(providerName) as AuthStorageEntry | undefined,
+		});
+	};
+
+	for (const checker of PROVIDER_QUOTA_CHECKERS) {
+		if (ctx.modelRegistry.authStorage.hasAuth(checker.baseProvider)) {
+			pushAccount(
+				checker.baseProvider,
+				PROVIDER_TEMPLATES[checker.baseProvider]?.displayName || checker.baseProvider,
+			);
+		}
+		for (const entry of allSubs) {
+			if (entry.provider !== checker.baseProvider) continue;
+			pushAccount(subProviderName(entry), subDisplayName(entry));
+		}
+	}
+
+	return accounts;
+}
+
+const codexQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "openai-codex",
+	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
+		const auth = account.auth;
+		if (!auth || auth.type !== "oauth" || typeof auth.access !== "string" || auth.access.length === 0) {
+			return {
+				account,
+				kind: "missing-auth",
+				summary: "not logged in",
+				details: [
+					`account: ${account.displayName}`,
+					`provider: ${account.providerName}`,
+					"status: not logged in",
+					"login: use /subs login or /login to authenticate this account",
+				],
+				score: 0,
+			};
+		}
+
+		const tokenMetadata = getCodexTokenMetadata(auth.access);
+		const accountId = typeof auth.accountId === "string" && auth.accountId.length > 0
+			? auth.accountId
+			: tokenMetadata.accountId;
+		const baseUrl = (process.env.CHATGPT_BASE_URL || DEFAULT_CODEX_USAGE_BASE_URL).replace(/\/+$/, "");
+		const headers = new Headers({
+			Authorization: `Bearer ${auth.access}`,
+			Accept: "application/json",
+			"User-Agent": "pi-multi-pass",
+		});
+		if (accountId) {
+			headers.set("chatgpt-account-id", accountId);
+		}
+
+		try {
+			const response = await fetch(`${baseUrl}/wham/usage`, {
+				method: "GET",
+				headers,
+				signal,
+			});
+			if (!response.ok) {
+				const error = await readResponseError(response);
+				return {
+					account,
+					kind: "error",
+					summary: error,
+					details: [
+						`account: ${account.displayName}`,
+						`provider: ${account.providerName}`,
+						`status: error`,
+						`details: ${error}`,
+					],
+					score: 0,
+				};
+			}
+
+			const snapshot = parseCodexUsageSnapshot(await response.json());
+			if (!snapshot.email && tokenMetadata.email) snapshot.email = tokenMetadata.email;
+			if ((!snapshot.planType || snapshot.planType === "unknown") && tokenMetadata.planType) {
+				snapshot.planType = tokenMetadata.planType;
+			}
+			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
+			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+			const classification = classifyCodexQuotaKind(snapshot);
+			const summary = [
+				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
+				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
+				`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly?.resetAt)})`,
+				formatQuotaKind(classification.kind),
+			].join(" | ");
+			const details = [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				`status: ${formatQuotaKind(classification.kind)}`,
+				`plan: ${snapshot.planType}`,
+			];
+			if (snapshot.email) {
+				details.push(`email: ${snapshot.email}`);
+			}
+			details.push(
+				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
+				`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
+				`endpoint: ${baseUrl}/wham/usage`,
+			);
+			return {
+				account,
+				kind: classification.kind,
+				summary,
+				details,
+				score: classification.score,
+			};
+		} catch (error: unknown) {
+			if (signal?.aborted || isAbortError(error)) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			return {
+				account,
+				kind: "error",
+				summary: message,
+				details: [
+					`account: ${account.displayName}`,
+					`provider: ${account.providerName}`,
+					"status: error",
+					`details: ${message}`,
+				],
+				score: 0,
+			};
+		}
+	},
+};
+
+const googleGeminiCliQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "google-gemini-cli",
+	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
+		return checkGoogleQuotaAccount(account, fetchGoogleGeminiQuotaSnapshot, signal);
+	},
+};
+
+const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "google-antigravity",
+	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
+		return checkGoogleQuotaAccount(account, fetchGoogleAntigravityQuotaSnapshot, signal);
+	},
+};
+
+const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
+	codexQuotaChecker,
+	googleGeminiCliQuotaChecker,
+	googleAntigravityQuotaChecker,
+];
+
+async function showQuotaDetails(
+	ctx: ExtensionCommandContext,
+	result: QuotaCheckResult,
+): Promise<void> {
+	await showWrappedSelect(ctx, {
+		title: `Limit Details: ${result.account.displayName}`,
+		subtitle: "Press Enter or Escape to go back to the limits list.",
+		items: result.details.map((detail, index) => ({ value: `${index}:${detail}`, label: detail })),
+		confirmHint: "back",
+		cancelHint: "back",
+	});
+}
+
+async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
+	const accounts = collectQuotaAccounts(ctx);
+	if (accounts.length === 0) {
+		ctx.ui.notify(
+			"No supported subscription limits are available yet. Login to a supported provider first.",
+			"info",
+		);
+		return;
+	}
+
+	const results = await loadQuotaResults(ctx, accounts);
+	if (!results) {
+		ctx.ui.notify("Cancelled subscription limit check.", "info");
+		return;
+	}
+	if (results.length === 0) {
+		ctx.ui.notify("No supported quota checks matched the configured subscriptions.", "info");
+		return;
+	}
+
+	let preferredProviderName = ctx.model?.provider;
+	while (true) {
+		const selected = await selectQuotaResult(ctx, results, preferredProviderName);
+		if (!selected) return;
+		preferredProviderName = selected.account.providerName;
+		await showQuotaDetails(ctx, selected);
+	}
+}
 
 // ==========================================================================
 // Config persistence (~/.pi/agent/multi-pass.json)
@@ -463,8 +1631,9 @@ function subProviderName(entry: SubEntry): string {
 
 function subDisplayName(entry: SubEntry): string {
 	const template = PROVIDER_TEMPLATES[entry.provider];
-	const label = entry.label ? ` (${entry.label})` : "";
-	return `${template?.displayName || entry.provider} #${entry.index}${label}`;
+	const providerName = `${template?.displayName || entry.provider} #${entry.index}`;
+	if (!entry.label) return providerName;
+	return `${entry.label} — ${providerName}`;
 }
 
 /** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex" */
@@ -1001,40 +2170,215 @@ class PoolManager {
 // /subs command handlers
 // ==========================================================================
 
-async function handleSubsList(ctx: ExtensionCommandContext, config: MultiPassConfig): Promise<void> {
-	const envEntries = parseEnvConfig();
-	const all = normalizeEntries(mergeConfigs(config, envEntries));
+function getSubscriptionSource(config: MultiPassConfig, entry: SubEntry): "config" | "env" {
+	return config.subscriptions.find(
+		(s) => s.provider === entry.provider && s.index === entry.index,
+	)
+		? "config"
+		: "env";
+}
 
-	if (all.length === 0) {
-		ctx.ui.notify("No extra subscriptions configured. Use /subs add to create one.", "info");
+function formatSubscriptionMeta(
+	entry: SubEntry,
+	config: MultiPassConfig,
+	authStorage: { hasAuth(provider: string): boolean },
+): string {
+	const name = subProviderName(entry);
+	const hasAuth = authStorage.hasAuth(name);
+	const status = hasAuth ? "[logged in]" : "[not logged in]";
+	const source = getSubscriptionSource(config, entry);
+	return `${status} (${source})`;
+}
+
+function formatSubscriptionListLine(
+	entry: SubEntry,
+	config: MultiPassConfig,
+	authStorage: { hasAuth(provider: string): boolean },
+): string {
+	return `${subDisplayName(entry)} -- ${formatSubscriptionMeta(entry, config, authStorage)}`;
+}
+
+async function renameSubscriptionLabel(
+	ctx: ExtensionCommandContext,
+	config: MultiPassConfig,
+	entry: SubEntry,
+): Promise<void> {
+	const previousName = subDisplayName(entry);
+	const nextLabel = await ctx.ui.input(
+		"Friendly label (optional)",
+		entry.label || "e.g. work, personal, team, outlook",
+	);
+	if (nextLabel === undefined) return;
+
+	entry.label = nextLabel.trim() || undefined;
+	saveGlobalConfig(config);
+
+	const nextName = subDisplayName(entry);
+	if (nextName === previousName) {
+		ctx.ui.notify(`No changes for ${nextName}.`, "info");
 		return;
 	}
 
-	const lines = all.map((entry) => {
-		const name = subProviderName(entry);
-		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
-		const status = hasAuth ? "[logged in]" : "[not logged in]";
-		const source = config.subscriptions.find(
-			(s) => s.provider === entry.provider && s.index === entry.index,
-		)
-			? "config"
-			: "env";
-		return `${subDisplayName(entry)} -- ${status} (${source})`;
-	});
+	ctx.ui.notify(`Updated ${previousName} -> ${nextName}`, "info");
+}
 
-	await ctx.ui.select("Extra Subscriptions", lines);
+async function removeSubscriptionEntry(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	config: MultiPassConfig,
+	entry: SubEntry,
+	poolManager: PoolManager,
+): Promise<void> {
+	const confirmed = await ctx.ui.confirm(
+		"Confirm removal",
+		`Remove ${subDisplayName(entry)}?\nThis will also logout if authenticated.`,
+	);
+	if (!confirmed) return;
+
+	const name = subProviderName(entry);
+	if (ctx.modelRegistry.authStorage.hasAuth(name)) {
+		ctx.modelRegistry.authStorage.logout(name);
+	}
+	pi.unregisterProvider(name);
+
+	for (const pool of config.pools) {
+		pool.members = pool.members.filter((member) => member !== name);
+	}
+	const removedPoolNames = new Set(
+		config.pools.filter((pool) => pool.members.length === 0).map((pool) => pool.name),
+	);
+	config.pools = config.pools.filter((pool) => pool.members.length > 0);
+	if (removedPoolNames.size > 0) {
+		const pruned = pruneRemovedPoolReferences(config.chains, removedPoolNames);
+		config.chains = pruned.chains;
+	}
+	config.subscriptions = config.subscriptions.filter(
+		(candidate) => !(candidate.provider === entry.provider && candidate.index === entry.index),
+	);
+
+	saveGlobalConfig(config);
+	ctx.modelRegistry.refresh();
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
+}
+
+async function showSubscriptionActions(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	config: MultiPassConfig,
+	entry: SubEntry,
+	poolManager: PoolManager,
+): Promise<void> {
+	const source = getSubscriptionSource(config, entry);
+	if (source === "env") {
+		await showWrappedSelect(ctx, {
+			title: `Subscription: ${subDisplayName(entry)}`,
+			subtitle: "This entry comes from MULTI_SUB and is read-only here.",
+			items: [
+				{
+					value: subProviderName(entry),
+					label: formatSubscriptionListLine(entry, config, ctx.modelRegistry.authStorage),
+				},
+			],
+			confirmHint: "back",
+			cancelHint: "back",
+		});
+		return;
+	}
+
+	const name = subProviderName(entry);
+	const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
+	const actionItems: SelectItem[] = [
+		{ value: "rename", label: "rename", description: "Change friendly label" },
+		hasAuth
+			? { value: "logout", label: "logout", description: "Log out this subscription" }
+			: { value: "login", label: "login", description: "Show login instructions" },
+		{ value: "remove", label: "remove", description: "Remove this subscription" },
+	];
+
+	const action = await showWrappedSelect(ctx, {
+		title: subDisplayName(entry),
+		subtitle: "Escape returns to the subscriptions list.",
+		items: actionItems,
+		confirmHint: "open",
+		cancelHint: "back",
+	});
+	if (!action) return;
+
+	if (action === "rename") {
+		return renameSubscriptionLabel(ctx, config, entry);
+	}
+	if (action === "login") {
+		ctx.ui.notify(
+			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			"info",
+		);
+		return;
+	}
+	if (action === "logout") {
+		ctx.modelRegistry.authStorage.logout(name);
+		ctx.modelRegistry.refresh();
+		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
+		return;
+	}
+	if (action === "remove") {
+		return removeSubscriptionEntry(pi, ctx, config, entry, poolManager);
+	}
+}
+
+async function handleSubsList(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	config: MultiPassConfig,
+	poolManager: PoolManager,
+): Promise<void> {
+	let preferredProviderName: string | undefined = ctx.model?.provider;
+
+	while (true) {
+		const envEntries = parseEnvConfig();
+		const all = normalizeEntries(mergeConfigs(config, envEntries));
+
+		if (all.length === 0) {
+			ctx.ui.notify("No extra subscriptions configured. Use /subs add to create one.", "info");
+			return;
+		}
+
+		const selectedProviderName = await showWrappedSelect(ctx, {
+			title: "Extra Subscriptions",
+			subtitle: "Select a subscription for quick actions.",
+			items: all.map((entry) => ({
+				value: subProviderName(entry),
+				label: subDisplayName(entry),
+				description: formatSubscriptionMeta(entry, config, ctx.modelRegistry.authStorage),
+			})),
+			initialValue: preferredProviderName,
+			confirmHint: "open",
+			cancelHint: "close",
+		});
+		if (!selectedProviderName) return;
+
+		preferredProviderName = selectedProviderName;
+		const entry = all.find((candidate) => subProviderName(candidate) === selectedProviderName);
+		if (!entry) continue;
+		await showSubscriptionActions(pi, ctx, config, entry, poolManager);
+	}
 }
 
 async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const providerLabels = SUPPORTED_PROVIDERS.map((p) => {
-		const t = PROVIDER_TEMPLATES[p];
-		return `${p} -- ${t.displayName}`;
+	const providerItems: SelectItem[] = SUPPORTED_PROVIDERS.map((provider) => ({
+		value: provider,
+		label: provider,
+		description: PROVIDER_TEMPLATES[provider]?.displayName,
+	}));
+
+	const provider = await showWrappedSelect(ctx, {
+		title: "Select provider to add",
+		items: providerItems,
+		confirmHint: "select",
+		cancelHint: "close",
 	});
+	if (!provider) return;
 
-	const selected = await ctx.ui.select("Select provider to add", providerLabels);
-	if (!selected) return;
-
-	const provider = selected.split(" -- ")[0];
 	if (!PROVIDER_TEMPLATES[provider]) {
 		ctx.ui.notify(`Unknown provider: ${provider}`, "error");
 		return;
@@ -1078,50 +2422,39 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	}
 }
 
-async function handleSubsRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsRemove(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
 	const config = loadGlobalConfig();
 	if (config.subscriptions.length === 0) {
 		ctx.ui.notify("No saved subscriptions to remove.", "info");
 		return;
 	}
 
-	const options = config.subscriptions.map((entry) => {
-		const name = subProviderName(entry);
-		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
-		const status = hasAuth ? " [logged in]" : "";
-		return `${subDisplayName(entry)}${status}`;
+	const selectedProviderName = await showWrappedSelect(ctx, {
+		title: "Remove subscription",
+		subtitle: "Select a saved subscription to remove.",
+		initialValue: ctx.model?.provider,
+		items: config.subscriptions.map((entry) => ({
+			value: subProviderName(entry),
+			label: subDisplayName(entry),
+			description: ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry))
+				? "logged in"
+				: "not logged in",
+		})),
+		confirmHint: "remove",
+		cancelHint: "back",
 	});
+	if (!selectedProviderName) return;
 
-	const selected = await ctx.ui.select("Remove subscription", options);
-	if (!selected) return;
-
-	const idx = options.indexOf(selected);
-	if (idx < 0) return;
-
-	const entry = config.subscriptions[idx];
-	const confirmed = await ctx.ui.confirm(
-		"Confirm removal",
-		`Remove ${subDisplayName(entry)}?\nThis will also logout if authenticated.`,
+	const entry = config.subscriptions.find(
+		(candidate) => subProviderName(candidate) === selectedProviderName,
 	);
-	if (!confirmed) return;
+	if (!entry) return;
 
-	const name = subProviderName(entry);
-	if (ctx.modelRegistry.authStorage.hasAuth(name)) {
-		ctx.modelRegistry.authStorage.logout(name);
-	}
-	pi.unregisterProvider(name);
-
-	// Also remove from any pools
-	for (const pool of config.pools) {
-		pool.members = pool.members.filter((m) => m !== name);
-	}
-	// Remove empty pools
-	config.pools = config.pools.filter((p) => p.members.length > 0);
-
-	config.subscriptions.splice(idx, 1);
-	saveGlobalConfig(config);
-	ctx.modelRegistry.refresh();
-	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
+	return removeSubscriptionEntry(pi, ctx, config, entry, poolManager);
 }
 
 async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
@@ -1143,14 +2476,23 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 
-	const options = notLoggedIn.map((e) => subDisplayName(e));
-	const selected = await ctx.ui.select("Login to subscription", options);
-	if (!selected) return;
+	const selectedProviderName = await showWrappedSelect(ctx, {
+		title: "Login to subscription",
+		subtitle: "Select a subscription to see login instructions.",
+		initialValue: ctx.model?.provider,
+		items: notLoggedIn.map((entry) => ({
+			value: subProviderName(entry),
+			label: subDisplayName(entry),
+			description: "not logged in",
+		})),
+		confirmHint: "open",
+		cancelHint: "back",
+	});
+	if (!selectedProviderName) return;
 
-	const idx = options.indexOf(selected);
-	if (idx < 0) return;
+	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
+	if (!entry) return;
 
-	const entry = notLoggedIn[idx];
 	ctx.ui.notify(
 		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
 		"info",
@@ -1171,14 +2513,23 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 
-	const options = loggedIn.map((e) => subDisplayName(e));
-	const selected = await ctx.ui.select("Logout from subscription", options);
-	if (!selected) return;
+	const selectedProviderName = await showWrappedSelect(ctx, {
+		title: "Logout from subscription",
+		subtitle: "Select a subscription to log out.",
+		initialValue: ctx.model?.provider,
+		items: loggedIn.map((entry) => ({
+			value: subProviderName(entry),
+			label: subDisplayName(entry),
+			description: "logged in",
+		})),
+		confirmHint: "logout",
+		cancelHint: "back",
+	});
+	if (!selectedProviderName) return;
 
-	const idx = options.indexOf(selected);
-	if (idx < 0) return;
+	const entry = loggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
+	if (!entry) return;
 
-	const entry = loggedIn[idx];
 	ctx.modelRegistry.authStorage.logout(subProviderName(entry));
 	ctx.modelRegistry.refresh();
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
@@ -1233,7 +2584,13 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 		);
 	}
 
-	await ctx.ui.select("Subscription Status", lines);
+	await showWrappedSelect(ctx, {
+		title: "Subscription Status",
+		subtitle: "Press Enter or Escape to go back.",
+		items: lines.map((line, index) => ({ value: `${index}:${line}`, label: line })),
+		confirmHint: "back",
+		cancelHint: "back",
+	});
 }
 
 // ==========================================================================
@@ -1297,6 +2654,173 @@ function persistPoolConfig(
 	}
 	config.pools.push(pool);
 	return { action: "created", config };
+}
+
+function reloadPoolManagerForCurrentProject(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): void {
+	poolManager.loadPools(loadEffectiveConfig(ctx.cwd).pools);
+}
+
+function renamePoolReferences(
+	chains: ChainConfig[],
+	previousName: string,
+	nextName: string,
+): number {
+	let updatedEntries = 0;
+	for (const chain of chains) {
+		for (const entry of chain.entries) {
+			if (entry.pool !== previousName) continue;
+			entry.pool = nextName;
+			updatedEntries += 1;
+		}
+	}
+	return updatedEntries;
+}
+
+function pruneRemovedPoolReferences(
+	chains: ChainConfig[],
+	removedPoolNames: Set<string>,
+): { chains: ChainConfig[]; removedEntries: number; removedChains: number } {
+	let removedEntries = 0;
+	let removedChains = 0;
+
+	for (const chain of chains) {
+		const beforeCount = chain.entries.length;
+		chain.entries = chain.entries.filter((entry) => !removedPoolNames.has(entry.pool));
+		removedEntries += beforeCount - chain.entries.length;
+	}
+
+	const remainingChains = chains.filter((chain) => {
+		if (chain.entries.length > 0) return true;
+		removedChains += 1;
+		return false;
+	});
+
+	return { chains: remainingChains, removedEntries, removedChains };
+}
+
+async function renamePoolConfig(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	const previousName = pool.name;
+	const nextName = await ctx.ui.input("Pool name", pool.name);
+	if (nextName === undefined) return;
+
+	const trimmedName = nextName.trim();
+	if (!trimmedName) {
+		ctx.ui.notify("Pool name is required.", "warning");
+		return;
+	}
+	if (trimmedName === previousName) {
+		ctx.ui.notify(`No changes for pool "${previousName}".`, "info");
+		return;
+	}
+	if (config.pools.some((candidate) => candidate.name === trimmedName)) {
+		ctx.ui.notify(`Pool "${trimmedName}" already exists.`, "warning");
+		return;
+	}
+
+	pool.name = trimmedName;
+	const updatedEntries = renamePoolReferences(config.chains, previousName, trimmedName);
+	saveGlobalConfig(config);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(
+		updatedEntries > 0
+			? `Renamed pool "${previousName}" -> "${trimmedName}" and updated ${updatedEntries} chain entr${updatedEntries === 1 ? "y" : "ies"}.`
+			: `Renamed pool "${previousName}" -> "${trimmedName}".`,
+		"info",
+	);
+}
+
+async function editPoolMembers(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const availableProviders = getAllProvidersForBase(pool.baseProvider, allSubs);
+	const selectedMembers = [...pool.members];
+
+	while (true) {
+		const removableItems: SelectItem[] = selectedMembers.map((member) => ({
+			value: `remove:${member}`,
+			label: `remove ${member}`,
+			description: ctx.modelRegistry.authStorage.hasAuth(member) ? "logged in" : "not logged in",
+		}));
+		const addableItems: SelectItem[] = availableProviders
+			.filter((providerName) => !selectedMembers.includes(providerName))
+			.map((providerName) => ({
+				value: `add:${providerName}`,
+				label: `add ${providerName}`,
+				description: ctx.modelRegistry.authStorage.hasAuth(providerName)
+					? "logged in"
+					: "not logged in",
+			}));
+
+		const action = await showWrappedSelect(ctx, {
+			title: `Pool Members: ${pool.name}`,
+			subtitle: [
+				`Base provider: ${pool.baseProvider}`,
+				`Selected (${selectedMembers.length}): ${selectedMembers.join(", ") || "none"}`,
+				"Choose add/remove entries, then save when done.",
+			].join("\n"),
+			items: [
+				{
+					value: "save",
+					label: "save",
+					description: "Persist member changes",
+				},
+				...removableItems,
+				...addableItems,
+			],
+			confirmHint: "select",
+			cancelHint: "back",
+		});
+		if (!action) return;
+
+		if (action === "save") {
+			const validation = createPoolValidationMessage(selectedMembers);
+			if (validation) {
+				ctx.ui.notify(validation, "warning");
+				continue;
+			}
+			const changed = pool.members.length !== selectedMembers.length
+				|| pool.members.some((member, index) => member !== selectedMembers[index]);
+			if (!changed) {
+				ctx.ui.notify(`No changes for pool "${pool.name}".`, "info");
+				return;
+			}
+			pool.members = [...selectedMembers];
+			saveGlobalConfig(config);
+			reloadPoolManagerForCurrentProject(ctx, poolManager);
+			ctx.ui.notify(
+				`Updated pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.`,
+				"info",
+			);
+			return;
+		}
+
+		if (action.startsWith("remove:")) {
+			const member = action.slice("remove:".length);
+			const index = selectedMembers.indexOf(member);
+			if (index >= 0) selectedMembers.splice(index, 1);
+			continue;
+		}
+
+		if (action.startsWith("add:")) {
+			const member = action.slice("add:".length);
+			if (!selectedMembers.includes(member)) {
+				selectedMembers.push(member);
+			}
+		}
+	}
 }
 
 async function promptForPoolDefinition(
@@ -1415,7 +2939,7 @@ async function createAndPersistPool(
 	const config = loadGlobalConfig();
 	const persisted = persistPoolConfig(config, pool);
 	saveGlobalConfig(persisted.config);
-	poolManager.loadPools(persisted.config.pools);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 	const resumeSuffix = options?.resumeChainName
 		? ` Chain builder resumed for "${options.resumeChainName}".`
@@ -1485,27 +3009,157 @@ async function handlePoolCreate(
 	await createAndPersistPool(ctx, poolManager, { allowOverwrite: true });
 }
 
+async function inspectPoolConfig(
+	ctx: ExtensionCommandContext,
+	pool: PoolConfig,
+	poolManager: PoolManager,
+): Promise<void> {
+	await showWrappedSelect(ctx, {
+		title: `Pool Status: ${pool.name}`,
+		subtitle: "Press Enter or Escape to go back to the pools list.",
+		items: formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager)
+			.map((line, index) => ({ value: `${index}:${line}`, label: line })),
+		confirmHint: "back",
+		cancelHint: "back",
+	});
+}
+
+async function togglePoolConfig(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	pool.enabled = !pool.enabled;
+	saveGlobalConfig(config);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`, "info");
+}
+
+async function removePoolConfig(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<boolean> {
+	const referencedEntries = config.chains.reduce(
+		(count, chain) => count + chain.entries.filter((entry) => entry.pool === pool.name).length,
+		0,
+	);
+	const confirmed = await ctx.ui.confirm(
+		"Confirm removal",
+		referencedEntries > 0
+			? `Remove pool "${pool.name}"? (Subscriptions are kept.)\n\nThis will also remove ${referencedEntries} chain entr${referencedEntries === 1 ? "y" : "ies"} that reference this pool.`
+			: `Remove pool "${pool.name}"? (Subscriptions are kept.)`,
+	);
+	if (!confirmed) return false;
+
+	const pruned = pruneRemovedPoolReferences(config.chains, new Set([pool.name]));
+	const removedEntries = pruned.removedEntries;
+	const removedChains = pruned.removedChains;
+	config.chains = pruned.chains;
+	config.pools = config.pools.filter((candidate) => candidate.name !== pool.name);
+	saveGlobalConfig(config);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+
+	let message = `Removed pool "${pool.name}"`;
+	if (removedEntries > 0) {
+		message += ` and ${removedEntries} linked chain entr${removedEntries === 1 ? "y" : "ies"}`;
+	}
+	if (removedChains > 0) {
+		message += ` (${removedChains} empty chain${removedChains === 1 ? "" : "s"} deleted)`;
+	}
+	ctx.ui.notify(`${message}.`, "info");
+	return true;
+}
+
+async function showPoolActions(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<"removed" | undefined> {
+	const action = await showWrappedSelect(ctx, {
+		title: pool.name,
+		subtitle: "Escape returns to the pools list.",
+		items: [
+			{ value: "inspect", label: "inspect", description: "View pool health and member status" },
+			{ value: "rename", label: "rename", description: "Change pool name" },
+			{ value: "members", label: "members", description: "Add or remove pool members" },
+			{
+				value: "toggle",
+				label: pool.enabled ? "disable" : "enable",
+				description: `Currently ${pool.enabled ? "enabled" : "disabled"}`,
+			},
+			{ value: "remove", label: "remove", description: "Delete this pool (subscriptions are kept)" },
+		],
+		confirmHint: "open",
+		cancelHint: "back",
+	});
+	if (!action) return undefined;
+
+	if (action === "inspect") {
+		await inspectPoolConfig(ctx, pool, poolManager);
+		return undefined;
+	}
+	if (action === "rename") {
+		await renamePoolConfig(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "members") {
+		await editPoolMembers(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "toggle") {
+		await togglePoolConfig(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "remove") {
+		const removed = await removePoolConfig(ctx, poolManager, config, pool);
+		return removed ? "removed" : undefined;
+	}
+	return undefined;
+}
+
 async function handlePoolList(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
-	const config = loadGlobalConfig();
-	const pools = config.pools;
+	let preferredPoolName: string | undefined;
 
-	if (pools.length === 0) {
-		ctx.ui.notify("No pools configured. Use /pool create to make one.", "info");
-		return;
+	while (true) {
+		const config = loadGlobalConfig();
+		const pools = config.pools;
+
+		if (pools.length === 0) {
+			ctx.ui.notify("No pools configured. Use /pool create to make one.", "info");
+			return;
+		}
+
+		const selectedPoolName = await showWrappedSelect(ctx, {
+			title: "Pools",
+			subtitle: "Select a pool for quick actions.",
+			items: pools.map((pool) => ({
+				value: pool.name,
+				label: pool.name,
+				description: formatPoolListDescription(pool, ctx.modelRegistry.authStorage, poolManager),
+			})),
+			initialValue: preferredPoolName,
+			confirmHint: "open",
+			cancelHint: "close",
+		});
+		if (!selectedPoolName) return;
+
+		preferredPoolName = selectedPoolName;
+		const pool = config.pools.find((candidate) => candidate.name === selectedPoolName);
+		if (!pool) continue;
+		const result = await showPoolActions(ctx, poolManager, config, pool);
+		if (result === "removed") {
+			preferredPoolName = undefined;
+			continue;
+		}
+		preferredPoolName = pool.name;
 	}
-
-	const lines = pools.map((pool) => {
-		const status = pool.enabled ? "enabled" : "disabled";
-		const authedCount = pool.members.filter((m) =>
-			ctx.modelRegistry.authStorage.hasAuth(m),
-		).length;
-		return `${pool.name} | ${pool.baseProvider} | ${pool.members.length} members (${authedCount} authed) | ${status}`;
-	});
-
-	await ctx.ui.select("Pools", lines);
 }
 
 async function handlePoolToggle(
@@ -1528,15 +3182,7 @@ async function handlePoolToggle(
 	const idx = options.indexOf(selected);
 	if (idx < 0) return;
 
-	config.pools[idx].enabled = !config.pools[idx].enabled;
-	saveGlobalConfig(config);
-	poolManager.loadPools(config.pools);
-
-	const pool = config.pools[idx];
-	ctx.ui.notify(
-		`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`,
-		"info",
-	);
+	return togglePoolConfig(ctx, poolManager, config, config.pools[idx]);
 }
 
 async function handlePoolRemove(
@@ -1560,17 +3206,7 @@ async function handlePoolRemove(
 	const idx = options.indexOf(selected);
 	if (idx < 0) return;
 
-	const pool = config.pools[idx];
-	const confirmed = await ctx.ui.confirm(
-		"Confirm removal",
-		`Remove pool "${pool.name}"? (Subscriptions are kept.)`,
-	);
-	if (!confirmed) return;
-
-	config.pools.splice(idx, 1);
-	saveGlobalConfig(config);
-	poolManager.loadPools(config.pools);
-	ctx.ui.notify(`Removed pool "${pool.name}"`, "info");
+	await removePoolConfig(ctx, poolManager, config, config.pools[idx]);
 }
 
 function summarizePoolHealth(
@@ -1587,7 +3223,6 @@ function summarizePoolHealth(
 	const availableMembers = pool.enabled
 		? poolManager.getAvailableMembers(pool, authStorage)
 		: [];
-	const availableSet = new Set(availableMembers);
 	let authedCount = 0;
 	for (const member of pool.members) {
 		if (authStorage.hasAuth(member)) authedCount += 1;
@@ -1616,14 +3251,14 @@ function summarizePoolHealth(
 	};
 }
 
-function formatPoolListLine(
+function formatPoolListDescription(
 	pool: PoolConfig,
 	authStorage: { hasAuth(provider: string): boolean },
 	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
 ): string {
 	const summary = summarizePoolHealth(pool, authStorage, poolManager);
 	const status = pool.enabled ? "enabled" : "disabled";
-	return `${pool.name} | ${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
+	return `${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
 }
 
 function formatPoolStatusLines(
@@ -2395,7 +4030,7 @@ async function handlePoolMenu(
 ): Promise<void> {
 	const actions = [
 		"create   -- Create a new rotation pool",
-		"list     -- Show all pools",
+		"list     -- Show pools and quick actions",
 		"chain    -- Manage saved fallback chains",
 		"toggle   -- Enable/disable a pool",
 		"remove   -- Remove a pool",
@@ -2426,7 +4061,7 @@ async function handlePoolMenu(
 }
 
 // ==========================================================================
-// /subs main menu (updated)
+// /subs main menu
 // ==========================================================================
 
 async function handleSubsMenu(
@@ -2434,33 +4069,52 @@ async function handleSubsMenu(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
-	const actions = [
-		"list     -- Show all extra subscriptions",
-		"add      -- Add a new subscription",
-		"remove   -- Remove a subscription",
-		"login    -- Login to a subscription",
-		"logout   -- Logout from a subscription",
-		"status   -- Show auth status and token info",
+	const actions: SelectItem[] = [
+		{ value: "list", label: "list", description: "Show all extra subscriptions" },
+		{ value: "add", label: "add", description: "Add a new subscription" },
+		{ value: "remove", label: "remove", description: "Remove a subscription" },
+		{ value: "login", label: "login", description: "Login to a subscription" },
+		{ value: "logout", label: "logout", description: "Logout from a subscription" },
+		{ value: "status", label: "status", description: "Show auth status and token info" },
+		{ value: "limits", label: "limits", description: "Check built-in quota support (Codex + Google)" },
 	];
+	let preferredAction = "list";
 
-	const selected = await ctx.ui.select("Subscription Manager", actions);
-	if (!selected) return;
+	while (true) {
+		const action = await showWrappedSelect(ctx, {
+			title: "Subscription Manager",
+			items: actions,
+			initialValue: preferredAction,
+			confirmHint: "open",
+			cancelHint: "close",
+		});
+		if (!action) return;
 
-	const action = selected.split(" ")[0].trim();
-	const config = loadGlobalConfig();
-	switch (action) {
-		case "list":
-			return handleSubsList(ctx, config);
-		case "add":
-			return handleSubsAdd(pi, ctx);
-		case "remove":
-			return handleSubsRemove(pi, ctx);
-		case "login":
-			return handleSubsLogin(ctx);
-		case "logout":
-			return handleSubsLogout(ctx);
-		case "status":
-			return handleSubsStatus(ctx);
+		preferredAction = action;
+		const config = loadGlobalConfig();
+		switch (action) {
+			case "list":
+				await handleSubsList(pi, ctx, config, poolManager);
+				break;
+			case "add":
+				await handleSubsAdd(pi, ctx);
+				break;
+			case "remove":
+				await handleSubsRemove(pi, ctx, poolManager);
+				break;
+			case "login":
+				await handleSubsLogin(ctx);
+				break;
+			case "logout":
+				await handleSubsLogout(ctx);
+				break;
+			case "status":
+				await handleSubsStatus(ctx);
+				break;
+			case "limits":
+				await handleSubsLimits(ctx);
+				break;
+		}
 	}
 }
 
@@ -2569,7 +4223,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "status"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "status", "limits"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -2581,14 +4235,14 @@ export default function multiSub(pi: ExtensionAPI) {
 			switch (subcommand) {
 				case "list":
 				case "ls":
-					return handleSubsList(ctx, config);
+					return handleSubsList(pi, ctx, config, poolManager);
 				case "add":
 				case "new":
 					return handleSubsAdd(pi, ctx);
 				case "remove":
 				case "rm":
 				case "delete":
-					return handleSubsRemove(pi, ctx);
+					return handleSubsRemove(pi, ctx, poolManager);
 				case "login":
 					return handleSubsLogin(ctx);
 				case "logout":
@@ -2596,6 +4250,10 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "status":
 				case "info":
 					return handleSubsStatus(ctx);
+				case "limits":
+				case "quota":
+				case "usage":
+					return handleSubsLimits(ctx);
 				default:
 					return handleSubsMenu(pi, ctx, poolManager);
 			}

@@ -19,6 +19,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
+- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
 - **TUI management**: `/subs` and `/pool` commands -- no config files needed
@@ -29,11 +30,12 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 ```
 /subs add              Pick a provider, add a subscription
 /login                 Authenticate the new subscription
+/subs limits           Check built-in quota support (Codex + Google)
 /pool create           Group subs into a rotation pool
 /pool chain create     Build an ordered fallback chain across pools
 ```
 
-When one account hits a rate limit, multi-pass automatically switches to the next eligible target and retries.
+When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
 
 ## Commands
 
@@ -45,8 +47,9 @@ When one account hits a rate limit, multi-pass automatically switches to the nex
 /subs remove       Remove a subscription
 /subs login        Login to a subscription
 /subs logout       Logout from a subscription
-/subs list         List all subscriptions with auth status
+/subs list         List subscriptions with auth status; select one for quick actions
 /subs status       Detailed status (token expiry, pool membership)
+/subs limits       Check built-in quota/usage support (Codex + Google)
 ```
 
 ### `/pool` -- Rotation pool and chain management
@@ -54,10 +57,10 @@ When one account hits a rate limit, multi-pass automatically switches to the nex
 ```
 /pool              Open menu
 /pool create       Create a pool (pick provider, select members)
-/pool list         Show all pools
+/pool list         Show pools; select one for quick actions
 /pool chain        Open chain manager
 /pool toggle       Enable/disable a pool
-/pool remove       Delete a pool (keeps subscriptions)
+/pool remove       Delete a pool (keeps subscriptions; prunes linked chain entries)
 /pool status       Member health (logged in, rate limited, cooling down)
 /pool project      Project-level config (restrict subs, override pools/chains)
 ```
@@ -159,6 +162,22 @@ cd ~/side-project
 | `github-copilot` | GitHub Copilot |
 | `google-gemini-cli` | Google Cloud Code Assist |
 | `google-antigravity` | Antigravity |
+
+## Built-in limits support
+
+`/subs limits` uses a provider-specific checker registry.
+
+Currently implemented:
+
+- `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
+- `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
+- `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
+
+Google quota is not a single flat subscription bucket, so the details view shows one line per returned Gemini family or Antigravity model with its remaining headroom and reset time.
+
+`/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now, but it does not proactively switch models by itself. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
+
+Future providers can add another checker without changing the `/subs` command surface.
 
 ## Environment variable (optional)
 
