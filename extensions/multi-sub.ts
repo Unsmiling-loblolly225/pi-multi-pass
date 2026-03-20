@@ -2656,6 +2656,173 @@ function persistPoolConfig(
 	return { action: "created", config };
 }
 
+function reloadPoolManagerForCurrentProject(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): void {
+	poolManager.loadPools(loadEffectiveConfig(ctx.cwd).pools);
+}
+
+function renamePoolReferences(
+	chains: ChainConfig[],
+	previousName: string,
+	nextName: string,
+): number {
+	let updatedEntries = 0;
+	for (const chain of chains) {
+		for (const entry of chain.entries) {
+			if (entry.pool !== previousName) continue;
+			entry.pool = nextName;
+			updatedEntries += 1;
+		}
+	}
+	return updatedEntries;
+}
+
+function pruneRemovedPoolReferences(
+	chains: ChainConfig[],
+	removedPoolNames: Set<string>,
+): { chains: ChainConfig[]; removedEntries: number; removedChains: number } {
+	let removedEntries = 0;
+	let removedChains = 0;
+
+	for (const chain of chains) {
+		const beforeCount = chain.entries.length;
+		chain.entries = chain.entries.filter((entry) => !removedPoolNames.has(entry.pool));
+		removedEntries += beforeCount - chain.entries.length;
+	}
+
+	const remainingChains = chains.filter((chain) => {
+		if (chain.entries.length > 0) return true;
+		removedChains += 1;
+		return false;
+	});
+
+	return { chains: remainingChains, removedEntries, removedChains };
+}
+
+async function renamePoolConfig(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	const previousName = pool.name;
+	const nextName = await ctx.ui.input("Pool name", pool.name);
+	if (nextName === undefined) return;
+
+	const trimmedName = nextName.trim();
+	if (!trimmedName) {
+		ctx.ui.notify("Pool name is required.", "warning");
+		return;
+	}
+	if (trimmedName === previousName) {
+		ctx.ui.notify(`No changes for pool "${previousName}".`, "info");
+		return;
+	}
+	if (config.pools.some((candidate) => candidate.name === trimmedName)) {
+		ctx.ui.notify(`Pool "${trimmedName}" already exists.`, "warning");
+		return;
+	}
+
+	pool.name = trimmedName;
+	const updatedEntries = renamePoolReferences(config.chains, previousName, trimmedName);
+	saveGlobalConfig(config);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(
+		updatedEntries > 0
+			? `Renamed pool "${previousName}" -> "${trimmedName}" and updated ${updatedEntries} chain entr${updatedEntries === 1 ? "y" : "ies"}.`
+			: `Renamed pool "${previousName}" -> "${trimmedName}".`,
+		"info",
+	);
+}
+
+async function editPoolMembers(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const availableProviders = getAllProvidersForBase(pool.baseProvider, allSubs);
+	const selectedMembers = [...pool.members];
+
+	while (true) {
+		const removableItems: SelectItem[] = selectedMembers.map((member) => ({
+			value: `remove:${member}`,
+			label: `remove ${member}`,
+			description: ctx.modelRegistry.authStorage.hasAuth(member) ? "logged in" : "not logged in",
+		}));
+		const addableItems: SelectItem[] = availableProviders
+			.filter((providerName) => !selectedMembers.includes(providerName))
+			.map((providerName) => ({
+				value: `add:${providerName}`,
+				label: `add ${providerName}`,
+				description: ctx.modelRegistry.authStorage.hasAuth(providerName)
+					? "logged in"
+					: "not logged in",
+			}));
+
+		const action = await showWrappedSelect(ctx, {
+			title: `Pool Members: ${pool.name}`,
+			subtitle: [
+				`Base provider: ${pool.baseProvider}`,
+				`Selected (${selectedMembers.length}): ${selectedMembers.join(", ") || "none"}`,
+				"Choose add/remove entries, then save when done.",
+			].join("\n"),
+			items: [
+				{
+					value: "save",
+					label: "save",
+					description: "Persist member changes",
+				},
+				...removableItems,
+				...addableItems,
+			],
+			confirmHint: "select",
+			cancelHint: "back",
+		});
+		if (!action) return;
+
+		if (action === "save") {
+			const validation = createPoolValidationMessage(selectedMembers);
+			if (validation) {
+				ctx.ui.notify(validation, "warning");
+				continue;
+			}
+			const changed = pool.members.length !== selectedMembers.length
+				|| pool.members.some((member, index) => member !== selectedMembers[index]);
+			if (!changed) {
+				ctx.ui.notify(`No changes for pool "${pool.name}".`, "info");
+				return;
+			}
+			pool.members = [...selectedMembers];
+			saveGlobalConfig(config);
+			reloadPoolManagerForCurrentProject(ctx, poolManager);
+			ctx.ui.notify(
+				`Updated pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.`,
+				"info",
+			);
+			return;
+		}
+
+		if (action.startsWith("remove:")) {
+			const member = action.slice("remove:".length);
+			const index = selectedMembers.indexOf(member);
+			if (index >= 0) selectedMembers.splice(index, 1);
+			continue;
+		}
+
+		if (action.startsWith("add:")) {
+			const member = action.slice("add:".length);
+			if (!selectedMembers.includes(member)) {
+				selectedMembers.push(member);
+			}
+		}
+	}
+}
+
 async function promptForPoolDefinition(
 	ctx: ExtensionCommandContext,
 	options?: {
@@ -2772,7 +2939,7 @@ async function createAndPersistPool(
 	const config = loadGlobalConfig();
 	const persisted = persistPoolConfig(config, pool);
 	saveGlobalConfig(persisted.config);
-	poolManager.loadPools(persisted.config.pools);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 	const resumeSuffix = options?.resumeChainName
 		? ` Chain builder resumed for "${options.resumeChainName}".`
@@ -2842,27 +3009,157 @@ async function handlePoolCreate(
 	await createAndPersistPool(ctx, poolManager, { allowOverwrite: true });
 }
 
+async function inspectPoolConfig(
+	ctx: ExtensionCommandContext,
+	pool: PoolConfig,
+	poolManager: PoolManager,
+): Promise<void> {
+	await showWrappedSelect(ctx, {
+		title: `Pool Status: ${pool.name}`,
+		subtitle: "Press Enter or Escape to go back to the pools list.",
+		items: formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager)
+			.map((line, index) => ({ value: `${index}:${line}`, label: line })),
+		confirmHint: "back",
+		cancelHint: "back",
+	});
+}
+
+async function togglePoolConfig(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	pool.enabled = !pool.enabled;
+	saveGlobalConfig(config);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`, "info");
+}
+
+async function removePoolConfig(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<boolean> {
+	const referencedEntries = config.chains.reduce(
+		(count, chain) => count + chain.entries.filter((entry) => entry.pool === pool.name).length,
+		0,
+	);
+	const confirmed = await ctx.ui.confirm(
+		"Confirm removal",
+		referencedEntries > 0
+			? `Remove pool "${pool.name}"? (Subscriptions are kept.)\n\nThis will also remove ${referencedEntries} chain entr${referencedEntries === 1 ? "y" : "ies"} that reference this pool.`
+			: `Remove pool "${pool.name}"? (Subscriptions are kept.)`,
+	);
+	if (!confirmed) return false;
+
+	const pruned = pruneRemovedPoolReferences(config.chains, new Set([pool.name]));
+	const removedEntries = pruned.removedEntries;
+	const removedChains = pruned.removedChains;
+	config.chains = pruned.chains;
+	config.pools = config.pools.filter((candidate) => candidate.name !== pool.name);
+	saveGlobalConfig(config);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+
+	let message = `Removed pool "${pool.name}"`;
+	if (removedEntries > 0) {
+		message += ` and ${removedEntries} linked chain entr${removedEntries === 1 ? "y" : "ies"}`;
+	}
+	if (removedChains > 0) {
+		message += ` (${removedChains} empty chain${removedChains === 1 ? "" : "s"} deleted)`;
+	}
+	ctx.ui.notify(`${message}.`, "info");
+	return true;
+}
+
+async function showPoolActions(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<"removed" | undefined> {
+	const action = await showWrappedSelect(ctx, {
+		title: pool.name,
+		subtitle: "Escape returns to the pools list.",
+		items: [
+			{ value: "inspect", label: "inspect", description: "View pool health and member status" },
+			{ value: "rename", label: "rename", description: "Change pool name" },
+			{ value: "members", label: "members", description: "Add or remove pool members" },
+			{
+				value: "toggle",
+				label: pool.enabled ? "disable" : "enable",
+				description: `Currently ${pool.enabled ? "enabled" : "disabled"}`,
+			},
+			{ value: "remove", label: "remove", description: "Delete this pool (subscriptions are kept)" },
+		],
+		confirmHint: "open",
+		cancelHint: "back",
+	});
+	if (!action) return undefined;
+
+	if (action === "inspect") {
+		await inspectPoolConfig(ctx, pool, poolManager);
+		return undefined;
+	}
+	if (action === "rename") {
+		await renamePoolConfig(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "members") {
+		await editPoolMembers(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "toggle") {
+		await togglePoolConfig(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "remove") {
+		const removed = await removePoolConfig(ctx, poolManager, config, pool);
+		return removed ? "removed" : undefined;
+	}
+	return undefined;
+}
+
 async function handlePoolList(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
-	const config = loadGlobalConfig();
-	const pools = config.pools;
+	let preferredPoolName: string | undefined;
 
-	if (pools.length === 0) {
-		ctx.ui.notify("No pools configured. Use /pool create to make one.", "info");
-		return;
+	while (true) {
+		const config = loadGlobalConfig();
+		const pools = config.pools;
+
+		if (pools.length === 0) {
+			ctx.ui.notify("No pools configured. Use /pool create to make one.", "info");
+			return;
+		}
+
+		const selectedPoolName = await showWrappedSelect(ctx, {
+			title: "Pools",
+			subtitle: "Select a pool for quick actions.",
+			items: pools.map((pool) => ({
+				value: pool.name,
+				label: pool.name,
+				description: formatPoolListDescription(pool, ctx.modelRegistry.authStorage, poolManager),
+			})),
+			initialValue: preferredPoolName,
+			confirmHint: "open",
+			cancelHint: "close",
+		});
+		if (!selectedPoolName) return;
+
+		preferredPoolName = selectedPoolName;
+		const pool = config.pools.find((candidate) => candidate.name === selectedPoolName);
+		if (!pool) continue;
+		const result = await showPoolActions(ctx, poolManager, config, pool);
+		if (result === "removed") {
+			preferredPoolName = undefined;
+			continue;
+		}
+		preferredPoolName = pool.name;
 	}
-
-	const lines = pools.map((pool) => {
-		const status = pool.enabled ? "enabled" : "disabled";
-		const authedCount = pool.members.filter((m) =>
-			ctx.modelRegistry.authStorage.hasAuth(m),
-		).length;
-		return `${pool.name} | ${pool.baseProvider} | ${pool.members.length} members (${authedCount} authed) | ${status}`;
-	});
-
-	await ctx.ui.select("Pools", lines);
 }
 
 async function handlePoolToggle(
@@ -2885,15 +3182,7 @@ async function handlePoolToggle(
 	const idx = options.indexOf(selected);
 	if (idx < 0) return;
 
-	config.pools[idx].enabled = !config.pools[idx].enabled;
-	saveGlobalConfig(config);
-	poolManager.loadPools(config.pools);
-
-	const pool = config.pools[idx];
-	ctx.ui.notify(
-		`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`,
-		"info",
-	);
+	return togglePoolConfig(ctx, poolManager, config, config.pools[idx]);
 }
 
 async function handlePoolRemove(
@@ -2917,17 +3206,7 @@ async function handlePoolRemove(
 	const idx = options.indexOf(selected);
 	if (idx < 0) return;
 
-	const pool = config.pools[idx];
-	const confirmed = await ctx.ui.confirm(
-		"Confirm removal",
-		`Remove pool "${pool.name}"? (Subscriptions are kept.)`,
-	);
-	if (!confirmed) return;
-
-	config.pools.splice(idx, 1);
-	saveGlobalConfig(config);
-	poolManager.loadPools(config.pools);
-	ctx.ui.notify(`Removed pool "${pool.name}"`, "info");
+	await removePoolConfig(ctx, poolManager, config, config.pools[idx]);
 }
 
 function summarizePoolHealth(
@@ -2944,7 +3223,6 @@ function summarizePoolHealth(
 	const availableMembers = pool.enabled
 		? poolManager.getAvailableMembers(pool, authStorage)
 		: [];
-	const availableSet = new Set(availableMembers);
 	let authedCount = 0;
 	for (const member of pool.members) {
 		if (authStorage.hasAuth(member)) authedCount += 1;
@@ -2973,14 +3251,14 @@ function summarizePoolHealth(
 	};
 }
 
-function formatPoolListLine(
+function formatPoolListDescription(
 	pool: PoolConfig,
 	authStorage: { hasAuth(provider: string): boolean },
 	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
 ): string {
 	const summary = summarizePoolHealth(pool, authStorage, poolManager);
 	const status = pool.enabled ? "enabled" : "disabled";
-	return `${pool.name} | ${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
+	return `${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
 }
 
 function formatPoolStatusLines(
@@ -3972,6 +4250,10 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "status":
 				case "info":
 					return handleSubsStatus(ctx);
+				case "limits":
+				case "quota":
+				case "usage":
+					return handleSubsLimits(ctx);
 				default:
 					return handleSubsMenu(pi, ctx, poolManager);
 			}
